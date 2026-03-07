@@ -41,8 +41,9 @@ class OnlineFilter:
 
         For ``'lowpass'``:
             cutoff_freq : float, optional
-                Cutoff frequency relative to the Nyquist frequency
-                (default: ``0.1``).
+                Cutoff frequency in the same units as ``sample_rate``
+                (default: ``0.1``).  Internally normalised to the Nyquist
+                frequency as ``cutoff_freq / (0.5 * sample_rate)``.
             sample_rate : float, optional
                 Sampling rate used to normalise ``cutoff_freq``
                 (default: ``1.0``).

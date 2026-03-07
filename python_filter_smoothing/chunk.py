@@ -84,10 +84,13 @@ class ChunkFilter:
             generated automatically with step ``dt`` starting from the
             end of the previously added chunk.
         dt : float, optional
-            Time step used both when auto-generating timestamps (``t`` is
-            ``None``) and as the gap between the last sample of this chunk
-            and the first auto-generated sample of the next chunk
-            (default: ``1.0``).
+            Time step used for two purposes:
+
+            1. When ``t`` is ``None``, timestamps are auto-generated with
+               this step size starting from the end of the previous chunk.
+            2. Regardless of whether ``t`` is provided, ``dt`` is added to
+               the last timestamp of this chunk to determine where the next
+               auto-generated chunk will start (default: ``1.0``).
 
         Raises
         ------
