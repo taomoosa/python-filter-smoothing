@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "python-filter-smoothing"
+version = "0.1.0"
+description = "Filter and smoothing utilities for time series data"
+requires-python = ">=3.8"
+license = "MIT"
+dependencies = [
+    "numpy",
+    "scipy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+viz = [
+    "rerun-sdk",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["python_filter_smoothing*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
