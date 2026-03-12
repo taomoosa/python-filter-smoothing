@@ -63,8 +63,11 @@ AVAILABLE_METHODS = [
 
 # Default filter keyword arguments per method
 _FILTER_KWARGS: dict[str, dict] = {
-    "rail": dict(poly_degree=3, dual_quintic=False, auto_align=True),
-    "act": dict(k=0.8, max_chunks=6),
+    "rail": dict(
+        poly_degree=3, dual_quintic=True, auto_align=True,
+        blend_order="cubic", blend_start_source="actual_output",
+    ),
+    "act": dict(k=0.01, max_chunks=6),
     "ema": dict(alpha=0.15),
     "linear": dict(),
     "spline": dict(),

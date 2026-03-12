@@ -463,16 +463,34 @@ class _PolyTrajectory:
     """Multi-dimensional polynomial trajectory fitted to chunk waypoints.
 
     Used internally by :class:`AsyncFilterRAIL` for intra-chunk smoothing.
+
+    Parameters
+    ----------
+    extrapolation : str
+        Behaviour when evaluating outside ``[t_start, t_end]``:
+
+        * ``"clamp"`` – hold boundary value (zero-order hold).
+        * ``"linear"`` – linear extrapolation from boundary value and
+          velocity (first-order hold).  Default.
+        * ``"poly"`` – unclamped polynomial evaluation (original
+          behaviour; may diverge far from the data range).
     """
 
-    __slots__ = ("t_start", "t_end", "_polys")
+    _VALID_EXTRAP = frozenset({"clamp", "linear", "poly"})
+
+    __slots__ = ("t_start", "t_end", "_polys", "_extrapolation")
 
     def __init__(
-        self, t_start: float, t_end: float, polys: list[np.poly1d]
+        self,
+        t_start: float,
+        t_end: float,
+        polys: list[np.poly1d],
+        extrapolation: str = "linear",
     ) -> None:
         self.t_start = t_start
         self.t_end = t_end
         self._polys = polys
+        self._extrapolation = extrapolation
 
     @classmethod
     def fit(
@@ -480,26 +498,167 @@ class _PolyTrajectory:
         t: np.ndarray,
         x: np.ndarray,
         degree: int,
+        extrapolation: str = "linear",
     ) -> "_PolyTrajectory":
         """Fit polynomial of given *degree* to each dimension of *x*."""
         n_dims = x.shape[1]
         deg = min(degree, len(t) - 1)
         polys = [np.poly1d(np.polyfit(t, x[:, d], deg)) for d in range(n_dims)]
-        return cls(float(t[0]), float(t[-1]), polys)
+        return cls(float(t[0]), float(t[-1]), polys, extrapolation)
 
     def evaluate(self, t: float) -> np.ndarray:
-        """Evaluate trajectory at time *t*."""
-        return np.array([float(p(t)) for p in self._polys])
+        """Evaluate trajectory at time *t* with extrapolation handling."""
+        if self._extrapolation == "poly" or self.t_start <= t <= self.t_end:
+            return np.array([float(p(t)) for p in self._polys])
+
+        if self._extrapolation == "clamp":
+            t_c = max(self.t_start, min(t, self.t_end))
+            return np.array([float(p(t_c)) for p in self._polys])
+
+        # "linear": first-order hold from boundary
+        if t < self.t_start:
+            t_b = self.t_start
+        else:
+            t_b = self.t_end
+        pos = np.array([float(p(t_b)) for p in self._polys])
+        vel = np.array([float(p.deriv()(t_b)) for p in self._polys])
+        return pos + vel * (t - t_b)
 
     def evaluate_deriv(self, t: float, order: int = 1) -> np.ndarray:
         """Evaluate *order*-th derivative of trajectory at time *t*."""
-        result = np.empty(len(self._polys))
-        for d, p in enumerate(self._polys):
+        derivs = []
+        for p in self._polys:
             dp = p
             for _ in range(order):
                 dp = dp.deriv()
-            result[d] = float(dp(t))
-        return result
+            derivs.append(dp)
+
+        if self._extrapolation == "poly" or self.t_start <= t <= self.t_end:
+            return np.array([float(dp(t)) for dp in derivs])
+
+        if self._extrapolation == "clamp":
+            t_c = max(self.t_start, min(t, self.t_end))
+            if order == 0:
+                return self.evaluate(t)
+            # Derivatives of a constant are zero
+            return np.zeros(len(self._polys))
+
+        # "linear": velocity is constant, higher derivs are zero
+        if order == 0:
+            return self.evaluate(t)
+        if order == 1:
+            t_b = self.t_start if t < self.t_start else self.t_end
+            return np.array([float(p.deriv()(t_b)) for p in self._polys])
+        return np.zeros(len(self._polys))
+
+
+class _CubicBlend:
+    """Single cubic polynomial blend ensuring C¹ continuity.
+
+    Uses position and velocity boundary conditions only (no acceleration),
+    avoiding the acceleration-cascade amplification problem that afflicts
+    C² quintic blends under noisy conditions.
+    """
+
+    __slots__ = ("t_start", "t_end", "_polys")
+
+    def __init__(
+        self,
+        traj_old: _PolyTrajectory,
+        traj_new: _PolyTrajectory,
+        t_start: float,
+        t_end: float,
+        *,
+        start_state: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    ) -> None:
+        self.t_start = t_start
+        self.t_end = t_end
+
+        if start_state is not None:
+            p0, v0, _a0 = start_state
+        else:
+            p0 = traj_old.evaluate(t_start)
+            v0 = traj_old.evaluate_deriv(t_start, 1)
+
+        p1 = traj_new.evaluate(t_end)
+        v1 = traj_new.evaluate_deriv(t_end, 1)
+
+        xi = np.array([t_start, t_end])
+        n_dims = len(p0)
+        self._polys: list[sp_interpolate.BPoly] = []
+        for d in range(n_dims):
+            yi = np.array([[p0[d], v0[d]], [p1[d], v1[d]]])
+            self._polys.append(sp_interpolate.BPoly.from_derivatives(xi, yi))
+
+    def evaluate(self, t: float) -> np.ndarray:
+        return np.array([float(p(t)) for p in self._polys])
+
+    def evaluate_deriv(self, t: float, order: int = 1) -> np.ndarray:
+        return np.array([float(p.derivative(order)(t)) for p in self._polys])
+
+
+class _DualCubicBlend:
+    """Dual cubic blend (C¹ variant of dual-quintic).
+
+    Splits the blend into two cubic halves at the midpoint.
+    Midpoint conditions: averaged position & velocity (no acceleration).
+    """
+
+    __slots__ = ("t_start", "t_end", "_t_mid", "_left_polys", "_right_polys")
+
+    def __init__(
+        self,
+        traj_old: _PolyTrajectory,
+        traj_new: _PolyTrajectory,
+        t_start: float,
+        t_end: float,
+        *,
+        start_state: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    ) -> None:
+        self.t_start = t_start
+        self.t_end = t_end
+        self._t_mid = 0.5 * (t_start + t_end)
+
+        if start_state is not None:
+            p0, v0, _a0 = start_state
+        else:
+            p0 = traj_old.evaluate(t_start)
+            v0 = traj_old.evaluate_deriv(t_start, 1)
+
+        p1 = traj_new.evaluate(t_end)
+        v1 = traj_new.evaluate_deriv(t_end, 1)
+
+        p_mid = 0.5 * (p0 + p1)
+        v_mid = 0.5 * (v0 + v1)
+
+        n_dims = len(p0)
+        self._left_polys: list[sp_interpolate.BPoly] = []
+        self._right_polys: list[sp_interpolate.BPoly] = []
+        for d in range(n_dims):
+            xi_l = np.array([t_start, self._t_mid])
+            yi_l = np.array([[p0[d], v0[d]], [p_mid[d], v_mid[d]]])
+            self._left_polys.append(
+                sp_interpolate.BPoly.from_derivatives(xi_l, yi_l)
+            )
+            xi_r = np.array([self._t_mid, t_end])
+            yi_r = np.array([[p_mid[d], v_mid[d]], [p1[d], v1[d]]])
+            self._right_polys.append(
+                sp_interpolate.BPoly.from_derivatives(xi_r, yi_r)
+            )
+
+    def evaluate(self, t: float) -> np.ndarray:
+        if t < self._t_mid:
+            return np.array([float(p(t)) for p in self._left_polys])
+        return np.array([float(p(t)) for p in self._right_polys])
+
+    def evaluate_deriv(self, t: float, order: int = 1) -> np.ndarray:
+        if t < self._t_mid:
+            return np.array(
+                [float(p.derivative(order)(t)) for p in self._left_polys]
+            )
+        return np.array(
+            [float(p.derivative(order)(t)) for p in self._right_polys]
+        )
 
 
 class _QuinticBlend:
@@ -521,15 +680,21 @@ class _QuinticBlend:
         traj_new: _PolyTrajectory,
         t_start: float,
         t_end: float,
+        *,
+        start_state: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     ) -> None:
         self.t_start = t_start
         self.t_end = t_end
 
-        # Boundary conditions from old and new trajectories
-        p0 = traj_old.evaluate(t_start)
-        v0 = traj_old.evaluate_deriv(t_start, 1)
-        a0 = traj_old.evaluate_deriv(t_start, 2)
+        # Boundary conditions at blend start
+        if start_state is not None:
+            p0, v0, a0 = start_state
+        else:
+            p0 = traj_old.evaluate(t_start)
+            v0 = traj_old.evaluate_deriv(t_start, 1)
+            a0 = traj_old.evaluate_deriv(t_start, 2)
 
+        # Boundary conditions at blend end (always from new trajectory)
         p1 = traj_new.evaluate(t_end)
         v1 = traj_new.evaluate_deriv(t_end, 1)
         a1 = traj_new.evaluate_deriv(t_end, 2)
@@ -544,6 +709,10 @@ class _QuinticBlend:
     def evaluate(self, t: float) -> np.ndarray:
         """Evaluate the blend polynomial at time *t*."""
         return np.array([float(p(t)) for p in self._polys])
+
+    def evaluate_deriv(self, t: float, order: int = 1) -> np.ndarray:
+        """Evaluate *order*-th derivative of the blend at time *t*."""
+        return np.array([float(p.derivative(order)(t)) for p in self._polys])
 
 
 class _DualQuinticBlend:
@@ -565,15 +734,20 @@ class _DualQuinticBlend:
         traj_new: _PolyTrajectory,
         t_start: float,
         t_end: float,
+        *,
+        start_state: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     ) -> None:
         self.t_start = t_start
         self.t_end = t_end
         self._t_mid = 0.5 * (t_start + t_end)
 
         # Old trajectory at blend start
-        p0 = traj_old.evaluate(t_start)
-        v0 = traj_old.evaluate_deriv(t_start, 1)
-        a0 = traj_old.evaluate_deriv(t_start, 2)
+        if start_state is not None:
+            p0, v0, a0 = start_state
+        else:
+            p0 = traj_old.evaluate(t_start)
+            v0 = traj_old.evaluate_deriv(t_start, 1)
+            a0 = traj_old.evaluate_deriv(t_start, 2)
 
         # New trajectory at blend end
         p1 = traj_new.evaluate(t_end)
@@ -604,6 +778,16 @@ class _DualQuinticBlend:
         if t < self._t_mid:
             return np.array([float(p(t)) for p in self._left_polys])
         return np.array([float(p(t)) for p in self._right_polys])
+
+    def evaluate_deriv(self, t: float, order: int = 1) -> np.ndarray:
+        """Evaluate *order*-th derivative of the blend at time *t*."""
+        if t < self._t_mid:
+            return np.array(
+                [float(p.derivative(order)(t)) for p in self._left_polys]
+            )
+        return np.array(
+            [float(p.derivative(order)(t)) for p in self._right_polys]
+        )
 
 
 # -- ACT temporal ensembling -----------------------------------------------
@@ -724,9 +908,8 @@ class AsyncFilterRAIL(AsyncFilterBase):
     1. **Intra-chunk smoothing** – fits a polynomial of degree *poly_degree*
        to each dimension of the incoming chunk, filtering high-frequency
        noise from VLA predictions.
-    2. **Inter-chunk fusion** – constructs a quintic polynomial blend at
-       chunk boundaries, ensuring C² continuity (position, velocity, and
-       acceleration) between successive trajectories.
+    2. **Inter-chunk fusion** – constructs a polynomial blend at chunk
+       boundaries, ensuring continuity between successive trajectories.
 
     Based on VLA-RAIL (Zhao et al., arXiv:2512.24673).
 
@@ -738,13 +921,12 @@ class AsyncFilterRAIL(AsyncFilterBase):
         Polynomial degree for intra-chunk smoothing (default: ``3``, i.e.
         cubic, as recommended by the VLA-RAIL paper).
     blend_duration : float or None, optional
-        Duration (seconds) of the inter-chunk quintic blend region.
+        Duration (seconds) of the inter-chunk blend region.
         If ``None`` (default), uses 30 % of the new chunk's duration.
     dual_quintic : bool, optional
-        If ``True`` (default), use dual-quintic spline interpolation
-        (VLA-RAIL Eq. 11-13) which splits the blend region into two
-        halves to avoid overshoot from Runge's phenomenon.
-        If ``False``, use a single quintic blend over the whole region.
+        If ``True`` (default), split the blend region into two halves at
+        the midpoint (VLA-RAIL Eq. 11-13) to avoid Runge's phenomenon.
+        If ``False``, use a single blend over the whole region.
     auto_align : bool, optional
         If ``True``, automatically correct new-chunk timestamps via
         temporal alignment optimisation (VLA-RAIL Eq. 10) that maximises
@@ -754,7 +936,55 @@ class AsyncFilterRAIL(AsyncFilterBase):
     align_window : float or None, optional
         Search window (seconds) for temporal alignment.  If ``None``
         (default), uses 50 % of the new chunk's duration.
+    blend_start_source : str, optional
+        Strategy for computing the boundary conditions at the start of
+        a new blend region.
+
+        * ``"actual_output"`` (default) – evaluate whichever curve the
+          output pipeline would actually return at the blend-start time
+          (may be a previous blend curve, not the raw polynomial).
+          Derivatives are computed analytically from that curve.
+        * ``"trajectory"`` – evaluate the old chunk's polynomial at
+          the blend-start time.  This was the original behaviour but
+          can suffer from position mismatches when the output was on
+          a blend curve.
+        * ``"output_history"`` – use finite differences of the most
+          recent outputs recorded by :meth:`get_output` to estimate
+          position, velocity, and acceleration.  Works even when the
+          underlying curves are unavailable or unreliable, but may be
+          noisy if the output sample rate is low.
+    blend_order : str, optional
+        Continuity order of the blend polynomial.
+
+        * ``"cubic"`` (default) – C¹ continuity (position + velocity).
+          Uses cubic polynomials.  Avoids the acceleration-cascade
+          amplification problem present in quintic blends.
+        * ``"quintic"`` – C² continuity (position + velocity +
+          acceleration).  Original VLA-RAIL behaviour.  May suffer
+          from overshoot when chunks arrive frequently under noisy
+          conditions.
+    acc_clamp : float or None, optional
+        Maximum absolute acceleration allowed in blend boundary
+        conditions.  Only effective when ``blend_order="quintic"``.
+        If ``None`` (default), no clamping is applied.
+        Recommended value: ``5.0``–``20.0`` depending on expected
+        trajectory dynamics.
+    extrapolation : str, optional
+        Behaviour when evaluating a polynomial trajectory outside its
+        fitted time range ``[t_start, t_end]``.
+
+        * ``"linear"`` (default) – first-order hold: extrapolate
+          linearly from boundary position and velocity.  Safe and
+          produces plausible output for short extrapolation.
+        * ``"clamp"`` – zero-order hold: hold the boundary value.
+        * ``"poly"`` – use the raw polynomial (original behaviour).
+          **Warning**: may diverge rapidly for higher-degree polynomials.
     """
+
+    _VALID_BLEND_SOURCES = frozenset(
+        {"trajectory", "actual_output", "output_history"}
+    )
+    _VALID_BLEND_ORDERS = frozenset({"cubic", "quintic"})
 
     def __init__(
         self,
@@ -764,18 +994,50 @@ class AsyncFilterRAIL(AsyncFilterBase):
         dual_quintic: bool = True,
         auto_align: bool = False,
         align_window: Optional[float] = None,
+        blend_start_source: str = "actual_output",
+        blend_order: str = "cubic",
+        acc_clamp: Optional[float] = None,
+        extrapolation: str = "linear",
     ) -> None:
         super().__init__(buffer_size=buffer_size)
+        if blend_start_source not in self._VALID_BLEND_SOURCES:
+            raise ValueError(
+                f"blend_start_source must be one of "
+                f"{sorted(self._VALID_BLEND_SOURCES)}, "
+                f"got {blend_start_source!r}."
+            )
+        if blend_order not in self._VALID_BLEND_ORDERS:
+            raise ValueError(
+                f"blend_order must be one of "
+                f"{sorted(self._VALID_BLEND_ORDERS)}, "
+                f"got {blend_order!r}."
+            )
+        if extrapolation not in _PolyTrajectory._VALID_EXTRAP:
+            raise ValueError(
+                f"extrapolation must be one of "
+                f"{sorted(_PolyTrajectory._VALID_EXTRAP)}, "
+                f"got {extrapolation!r}."
+            )
         self._poly_degree = int(poly_degree)
         self._blend_duration = blend_duration
         self._dual_quintic = bool(dual_quintic)
         self._auto_align = bool(auto_align)
         self._align_window = align_window
+        self._blend_start_source = blend_start_source
+        self._blend_order = blend_order
+        self._acc_clamp = float(acc_clamp) if acc_clamp is not None else None
+        self._extrapolation = extrapolation
         self._current_time: Optional[float] = None
         self._prev_traj: Optional[_PolyTrajectory] = None
         self._curr_traj: Optional[_PolyTrajectory] = None
-        # Blend object: either _QuinticBlend or _DualQuinticBlend
-        self._blend: Optional[_QuinticBlend | _DualQuinticBlend] = None
+        self._blend: Optional[
+            _CubicBlend | _DualCubicBlend
+            | _QuinticBlend | _DualQuinticBlend
+        ] = None
+        # Output history for "output_history" blend-start strategy.
+        self._output_history: deque[tuple[float, np.ndarray]] = deque(
+            maxlen=buffer_size
+        )
 
     # -- current-time interface ---------------------------------------------
 
@@ -845,8 +1107,120 @@ class AsyncFilterRAIL(AsyncFilterBase):
 
     # -- chunk interface ----------------------------------------------------
 
+    def _get_output_state_unlocked(
+        self, t_query: float
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (position, velocity, acceleration) from the active curve.
+
+        Must be called with ``self._lock`` held.  Uses the same priority
+        logic as :meth:`get_output` to find which curve is active, then
+        evaluates its derivatives analytically.
+        """
+        # Determine which source curve to use
+        source: _PolyTrajectory | _QuinticBlend | _DualQuinticBlend
+
+        if (
+            self._blend is not None
+            and self._blend.t_start <= t_query <= self._blend.t_end
+        ):
+            source = self._blend
+        elif (
+            self._blend is not None
+            and t_query < self._blend.t_start
+            and self._prev_traj is not None
+        ):
+            source = self._prev_traj
+        elif self._curr_traj is not None and t_query >= self._curr_traj.t_start:
+            source = self._curr_traj
+        elif self._prev_traj is not None:
+            source = self._prev_traj
+        else:
+            source = self._curr_traj  # type: ignore[assignment]
+
+        pos = source.evaluate(t_query)
+        vel = source.evaluate_deriv(t_query, 1)
+        acc = source.evaluate_deriv(t_query, 2)
+        return pos, vel, acc
+
+    def _estimate_state_from_history(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Estimate (position, velocity, acceleration) from output history.
+
+        Uses finite differences of :meth:`get_output` values recorded in
+        ``self._output_history``.  Must be called with ``self._lock`` held.
+        """
+        n = len(self._output_history)
+        if n < 1:
+            return None
+
+        pos = self._output_history[-1][1].copy()
+
+        if n < 2:
+            return pos, np.zeros_like(pos), np.zeros_like(pos)
+
+        t1, x1 = self._output_history[-1]
+        t0, x0 = self._output_history[-2]
+        dt = t1 - t0
+        vel = (x1 - x0) / dt if abs(dt) > 1e-12 else np.zeros_like(pos)
+
+        if n < 3:
+            return pos, vel, np.zeros_like(pos)
+
+        t_2, x_2 = self._output_history[-3]
+        dt0 = t0 - t_2
+        if abs(dt0) < 1e-12:
+            return pos, vel, np.zeros_like(pos)
+        vel_prev = (x0 - x_2) / dt0
+        dt_avg = 0.5 * (dt + dt0)
+        acc = (
+            (vel - vel_prev) / dt_avg
+            if abs(dt_avg) > 1e-12
+            else np.zeros_like(pos)
+        )
+        return pos, vel, acc
+
+    def _resolve_blend_start_state(
+        self, t_bs: float
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Compute blend-start boundary conditions per ``blend_start_source``.
+
+        Returns ``None`` when the default ``traj_old`` path should be used
+        (and no acc_clamp is configured).
+        Must be called with ``self._lock`` held.
+        """
+        state: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+
+        if self._blend_start_source == "actual_output":
+            state = self._get_output_state_unlocked(t_bs)
+        elif self._blend_start_source == "output_history":
+            state = self._estimate_state_from_history()
+        # else: "trajectory" → state stays None
+
+        # Apply acceleration clamp if configured
+        if self._acc_clamp is not None:
+            if state is None:
+                # Need to fetch from traj_old for clamping
+                if self._prev_traj is not None:
+                    p = self._prev_traj.evaluate(t_bs)
+                    v = self._prev_traj.evaluate_deriv(t_bs, 1)
+                    a = self._prev_traj.evaluate_deriv(t_bs, 2)
+                    state = (p, v, a)
+            if state is not None:
+                p, v, a = state
+                a = np.clip(a, -self._acc_clamp, self._acc_clamp)
+                state = (p, v, a)
+
+        return state
+
+    def _select_blend_cls(self):
+        """Return the blend class based on blend_order and dual_quintic."""
+        if self._blend_order == "cubic":
+            return _DualCubicBlend if self._dual_quintic else _CubicBlend
+        return _DualQuinticBlend if self._dual_quintic else _QuinticBlend
+
     def update_chunk(self, t, x) -> None:
-        """Add an action chunk with polynomial smoothing and C² fusion."""
+        """Add an action chunk with polynomial smoothing and blend fusion."""
         t_arr = np.asarray(t, dtype=float).ravel()
         x_arr = np.asarray(x, dtype=float)
         if x_arr.ndim == 1:
@@ -860,7 +1234,9 @@ class AsyncFilterRAIL(AsyncFilterBase):
                 self._dim = x_arr.shape[1]
 
             # Stage 1: Intra-chunk smoothing (polynomial fit)
-            traj = _PolyTrajectory.fit(t_arr, x_arr, self._poly_degree)
+            traj = _PolyTrajectory.fit(
+                t_arr, x_arr, self._poly_degree, self._extrapolation,
+            )
 
             # Optional: temporal alignment (shift chunk timestamps)
             if self._auto_align and self._current_time is not None:
@@ -870,10 +1246,11 @@ class AsyncFilterRAIL(AsyncFilterBase):
                 if abs(shift) > 1e-12:
                     t_shifted = t_arr + shift
                     traj = _PolyTrajectory.fit(
-                        t_shifted, x_arr, self._poly_degree
+                        t_shifted, x_arr, self._poly_degree,
+                        self._extrapolation,
                     )
 
-            # Stage 2: Inter-chunk fusion (quintic C² blend)
+            # Stage 2: Inter-chunk fusion (blend)
             if self._curr_traj is not None:
                 self._prev_traj = self._curr_traj
                 chunk_dur = traj.t_end - traj.t_start
@@ -894,13 +1271,11 @@ class AsyncFilterRAIL(AsyncFilterBase):
                 # Clamp blend end to not exceed new trajectory
                 t_be = min(t_be, traj.t_end)
                 if t_be > t_bs:
-                    BlendCls = (
-                        _DualQuinticBlend
-                        if self._dual_quintic
-                        else _QuinticBlend
-                    )
+                    BlendCls = self._select_blend_cls()
+                    start_state = self._resolve_blend_start_state(t_bs)
                     self._blend = BlendCls(
-                        self._prev_traj, traj, t_bs, t_be
+                        self._prev_traj, traj, t_bs, t_be,
+                        start_state=start_state,
                     )
                 else:
                     self._blend = None
@@ -928,7 +1303,9 @@ class AsyncFilterRAIL(AsyncFilterBase):
                 self._blend is not None
                 and self._blend.t_start <= t_query <= self._blend.t_end
             ):
-                return self._blend.evaluate(t_query)
+                result = self._blend.evaluate(t_query)
+                self._output_history.append((t_query, result.copy()))
+                return result
 
             # Before blend start: use previous (old) trajectory
             if (
@@ -936,17 +1313,25 @@ class AsyncFilterRAIL(AsyncFilterBase):
                 and t_query < self._blend.t_start
                 and self._prev_traj is not None
             ):
-                return self._prev_traj.evaluate(t_query)
+                result = self._prev_traj.evaluate(t_query)
+                self._output_history.append((t_query, result.copy()))
+                return result
 
             # After blend (or no blend): use current trajectory
             if t_query >= self._curr_traj.t_start:
-                return self._curr_traj.evaluate(t_query)
+                result = self._curr_traj.evaluate(t_query)
+                self._output_history.append((t_query, result.copy()))
+                return result
 
             # Before current trajectory: use previous if available
             if self._prev_traj is not None:
-                return self._prev_traj.evaluate(t_query)
+                result = self._prev_traj.evaluate(t_query)
+                self._output_history.append((t_query, result.copy()))
+                return result
 
-            return self._curr_traj.evaluate(t_query)
+            result = self._curr_traj.evaluate(t_query)
+            self._output_history.append((t_query, result.copy()))
+            return result
 
     # -- hooks / ABC --------------------------------------------------------
 
@@ -955,6 +1340,7 @@ class AsyncFilterRAIL(AsyncFilterBase):
         self._curr_traj = None
         self._blend = None
         self._current_time = None
+        self._output_history.clear()
 
     def _compute(
         self, t: np.ndarray, x: np.ndarray, t_query: float

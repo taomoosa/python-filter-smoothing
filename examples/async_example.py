@@ -170,9 +170,10 @@ def main() -> None:
         "moving_avg": AsyncFilter(
             method="moving_average", buffer_size=chunk_len, window=15,
         ),
-        "act": AsyncFilter(method="act", k=0.5, max_chunks=5),
+        "act": AsyncFilter(method="act", k=0.01, max_chunks=5),
         "rail": AsyncFilter(
-            method="rail", poly_degree=3, dual_quintic=False, auto_align=True,
+            method="rail", poly_degree=3, auto_align=True,
+            blend_order="cubic", blend_start_source="actual_output",
         ),
     }
 

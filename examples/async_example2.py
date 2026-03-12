@@ -278,7 +278,7 @@ def main() -> None:
             f"{dim}/rail", color=(80, 80, 255), name="rail (dual)", width=1.5,
         )
         configure_series_style(
-            f"{dim}/rail_single", color=(120, 120, 255), name="rail (single)", width=1.5,
+            f"{dim}/rail_quintic", color=(120, 120, 255), name="rail (quintic)", width=1.5,
         )
         configure_series_style(
             f"{dim}/ema", color=(255, 160, 0), name="ema", width=1.5,
@@ -293,14 +293,16 @@ def main() -> None:
     # --- filters ---
     buf = CHUNK_HORIZON * 4
     filters: dict[str, AsyncFilter] = {
-        "act": AsyncFilter(method="act", buffer_size=buf, k=0.8, max_chunks=6),
+        "act": AsyncFilter(method="act", buffer_size=buf, k=0.01, max_chunks=6),
         "rail": AsyncFilter(
             method="rail", buffer_size=buf, poly_degree=3,
             dual_quintic=True, auto_align=True,
+            blend_order="cubic", blend_start_source="actual_output",
         ),
-        "rail_single": AsyncFilter(
+        "rail_quintic": AsyncFilter(
             method="rail", buffer_size=buf, poly_degree=3,
-            dual_quintic=False,
+            dual_quintic=True, blend_order="quintic", acc_clamp=10.0,
+            blend_start_source="actual_output",
         ),
         "ema": AsyncFilter(method="ema", buffer_size=buf, alpha=0.15),
         "one_euro": AsyncFilter(

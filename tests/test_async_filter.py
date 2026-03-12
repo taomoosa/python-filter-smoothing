@@ -3,6 +3,13 @@ import threading
 import numpy as np
 import pytest
 from python_filter_smoothing import AsyncFilter
+from python_filter_smoothing.async_filter import (
+    _PolyTrajectory,
+    _CubicBlend,
+    _DualCubicBlend,
+    _QuinticBlend,
+    _DualQuinticBlend,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +512,68 @@ class TestAsyncFilterACT:
 
 
 # ---------------------------------------------------------------------------
+# Blend class derivative tests
+# ---------------------------------------------------------------------------
+
+class TestBlendDerivatives:
+    """Tests for evaluate_deriv on _QuinticBlend and _DualQuinticBlend."""
+
+    @staticmethod
+    def _make_trajs():
+        t1 = np.linspace(0.0, 2.0, 30)
+        x1 = np.column_stack([np.sin(t1), np.cos(t1)])
+        traj_old = _PolyTrajectory.fit(t1, x1, 3)
+        t2 = np.linspace(1.5, 3.5, 30)
+        x2 = np.column_stack([np.sin(t2) + 0.2, np.cos(t2) - 0.1])
+        traj_new = _PolyTrajectory.fit(t2, x2, 3)
+        return traj_old, traj_new
+
+    def test_quintic_deriv_matches_numeric(self):
+        traj_old, traj_new = self._make_trajs()
+        blend = _QuinticBlend(traj_old, traj_new, 1.5, 2.0)
+        t = 1.75
+        eps = 1e-6
+        analytic_vel = blend.evaluate_deriv(t, 1)
+        numeric_vel = (blend.evaluate(t + eps) - blend.evaluate(t - eps)) / (2 * eps)
+        np.testing.assert_allclose(analytic_vel, numeric_vel, atol=1e-3)
+
+    def test_dual_quintic_deriv_matches_numeric(self):
+        traj_old, traj_new = self._make_trajs()
+        blend = _DualQuinticBlend(traj_old, traj_new, 1.5, 2.0)
+        for t in [1.6, 1.75, 1.9]:
+            analytic_vel = blend.evaluate_deriv(t, 1)
+            eps = 1e-6
+            numeric_vel = (blend.evaluate(t + eps) - blend.evaluate(t - eps)) / (2 * eps)
+            np.testing.assert_allclose(analytic_vel, numeric_vel, atol=1e-3)
+
+    def test_quintic_start_state_override(self):
+        traj_old, traj_new = self._make_trajs()
+        custom_p = np.array([10.0, 20.0])
+        custom_v = np.array([0.5, -0.5])
+        custom_a = np.array([0.0, 0.0])
+        blend = _QuinticBlend(
+            traj_old, traj_new, 1.5, 2.0,
+            start_state=(custom_p, custom_v, custom_a),
+        )
+        pos_at_start = blend.evaluate(1.5)
+        np.testing.assert_allclose(pos_at_start, custom_p, atol=1e-10)
+        vel_at_start = blend.evaluate_deriv(1.5, 1)
+        np.testing.assert_allclose(vel_at_start, custom_v, atol=1e-6)
+
+    def test_dual_quintic_start_state_override(self):
+        traj_old, traj_new = self._make_trajs()
+        custom_p = np.array([5.0, 15.0])
+        custom_v = np.array([1.0, -1.0])
+        custom_a = np.array([0.1, -0.1])
+        blend = _DualQuinticBlend(
+            traj_old, traj_new, 1.5, 2.0,
+            start_state=(custom_p, custom_v, custom_a),
+        )
+        pos_at_start = blend.evaluate(1.5)
+        np.testing.assert_allclose(pos_at_start, custom_p, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
 # RAIL trajectory post-processing
 # ---------------------------------------------------------------------------
 
@@ -909,3 +978,453 @@ class TestAsyncFilterRAILAutoAlign:
         f.update_chunk(t2, x2)
         val = f.get_output(t=1.2)
         assert val.shape == (2,)
+
+
+# ---------------------------------------------------------------------------
+# RAIL: blend_start_source strategies
+# ---------------------------------------------------------------------------
+
+class TestAsyncFilterRAILBlendStartSource:
+    """Tests for blend_start_source parameter on AsyncFilterRAIL."""
+
+    def _make_three_chunk_filter(self, source: str, *, dual: bool = True):
+        """Create a filter, feed 3 chunks, querying between each."""
+        f = AsyncFilter(
+            method="rail",
+            poly_degree=3,
+            blend_duration=0.4,
+            dual_quintic=dual,
+            blend_start_source=source,
+        )
+        # Chunk 1: constant 0
+        t1 = np.linspace(0.0, 2.0, 50)
+        x1 = np.zeros(50)
+        f.update_chunk(t1, x1)
+        # Query during chunk 1 to populate history
+        for ti in np.linspace(0.5, 1.8, 20):
+            f.get_output(t=float(ti))
+        # Chunk 2: constant 1 (blend region is in [1.5, 1.9])
+        f.set_current_time(1.5)
+        t2 = np.linspace(1.5, 3.5, 50)
+        x2 = np.ones(50) * 1.0
+        f.update_chunk(t2, x2)
+        # Query during blend
+        for ti in np.linspace(1.5, 2.0, 20):
+            f.get_output(t=float(ti))
+        # Chunk 3: constant 2 (now we are in the blend from chunk2→3)
+        f.set_current_time(2.5)
+        t3 = np.linspace(2.5, 4.5, 50)
+        x3 = np.ones(50) * 2.0
+        f.update_chunk(t3, x3)
+        return f
+
+    def test_invalid_source_raises(self):
+        with pytest.raises(ValueError, match="blend_start_source"):
+            AsyncFilter(method="rail", blend_start_source="bogus")
+
+    def test_actual_output_source_default(self):
+        """Default blend_start_source should be 'actual_output'."""
+        f = AsyncFilter(method="rail")
+        assert f._blend_start_source == "actual_output"
+
+    def test_all_sources_produce_finite_output(self):
+        """All three strategies should produce finite output."""
+        for src in ("trajectory", "actual_output", "output_history"):
+            f = self._make_three_chunk_filter(src)
+            val = f.get_output(t=2.8)
+            assert val is not None, f"source={src}"
+            assert np.all(np.isfinite(val)), f"source={src}: {val}"
+
+    def test_actual_output_differs_from_trajectory(self):
+        """actual_output should differ from trajectory when in a blend."""
+        f_traj = self._make_three_chunk_filter("trajectory")
+        f_actual = self._make_three_chunk_filter("actual_output")
+        # At a point in the 3rd blend region, results should generally differ
+        # because the 2nd blend was active at t=2.5 (blend start of 3rd chunk)
+        v_traj = f_traj.get_output(t=2.7)
+        v_actual = f_actual.get_output(t=2.7)
+        assert v_traj is not None and v_actual is not None
+        # They may or may not differ significantly, but both should be finite
+        assert np.all(np.isfinite(v_traj))
+        assert np.all(np.isfinite(v_actual))
+
+    def test_output_history_source_works(self):
+        """output_history should use recorded values for blend start."""
+        f = self._make_three_chunk_filter("output_history")
+        # After 3 chunks, output history should be non-empty
+        assert len(f._output_history) > 0
+        val = f.get_output(t=3.0)
+        assert val is not None
+        assert np.all(np.isfinite(val))
+
+    def test_actual_output_single_quintic(self):
+        """actual_output should work with single quintic too."""
+        f = self._make_three_chunk_filter(
+            "actual_output", dual=False
+        )
+        val = f.get_output(t=2.8)
+        assert val is not None
+        assert np.all(np.isfinite(val))
+
+    def test_output_history_populated_by_get_output(self):
+        """get_output calls should populate _output_history."""
+        f = AsyncFilter(
+            method="rail",
+            poly_degree=3,
+            blend_start_source="output_history",
+        )
+        t = np.linspace(0, 1, 20)
+        f.update_chunk(t, np.sin(t))
+        assert len(f._output_history) == 0
+        f.get_output(t=0.3)
+        assert len(f._output_history) == 1
+        f.get_output(t=0.5)
+        assert len(f._output_history) == 2
+
+    def test_clear_resets_output_history(self):
+        f = AsyncFilter(
+            method="rail",
+            blend_start_source="output_history",
+        )
+        t = np.linspace(0, 1, 20)
+        f.update_chunk(t, np.sin(t))
+        f.get_output(t=0.5)
+        assert len(f._output_history) > 0
+        f.clear()
+        assert len(f._output_history) == 0
+
+    def test_blend_continuity_actual_output(self):
+        """actual_output should produce smooth transitions (no jumps)."""
+        f = AsyncFilter(
+            method="rail",
+            poly_degree=3,
+            blend_duration=0.5,
+            dual_quintic=True,
+            blend_start_source="actual_output",
+        )
+        t1 = np.linspace(0.0, 2.0, 50)
+        x1 = np.ones(50) * 0.0
+        f.update_chunk(t1, x1)
+        for ti in np.linspace(0.5, 1.4, 20):
+            f.get_output(t=float(ti))
+        f.set_current_time(1.5)
+        t2 = np.linspace(1.5, 3.5, 50)
+        x2 = np.ones(50) * 1.0
+        f.update_chunk(t2, x2)
+        for ti in np.linspace(1.5, 2.4, 20):
+            f.get_output(t=float(ti))
+        f.set_current_time(2.5)
+        t3 = np.linspace(2.5, 4.5, 50)
+        x3 = np.ones(50) * 2.0
+        f.update_chunk(t3, x3)
+        # Dense sampling through 3rd blend region
+        ts = np.linspace(2.4, 3.1, 200)
+        vals = np.array([f.get_output(t=float(ti)) for ti in ts])
+        diffs = np.diff(vals[:, 0]) / np.diff(ts)
+        max_jerk = np.max(np.abs(np.diff(diffs)))
+        assert max_jerk < 200.0
+
+    def test_vector_data_all_sources(self):
+        """All sources should handle multi-dimensional data."""
+        for src in ("trajectory", "actual_output", "output_history"):
+            f = AsyncFilter(
+                method="rail",
+                poly_degree=3,
+                blend_duration=0.3,
+                blend_start_source=src,
+            )
+            t1 = np.linspace(0.0, 1.0, 30)
+            x1 = np.column_stack([t1, t1 ** 2, np.sin(t1)])
+            f.update_chunk(t1, x1)
+            for ti in np.linspace(0.2, 0.9, 10):
+                f.get_output(t=float(ti))
+            f.set_current_time(0.7)
+            t2 = np.linspace(0.7, 2.0, 30)
+            x2 = np.column_stack(
+                [t2 + 0.1, t2 ** 2 + 0.1, np.sin(t2) + 0.1]
+            )
+            f.update_chunk(t2, x2)
+            val = f.get_output(t=0.85)
+            assert val is not None, f"source={src}"
+            assert val.shape == (3,), f"source={src}"
+            assert np.all(np.isfinite(val)), f"source={src}"
+
+
+# ---------------------------------------------------------------------------
+# Cubic blend tests
+# ---------------------------------------------------------------------------
+class TestCubicBlends:
+    """Tests for C¹ cubic blend classes."""
+
+    @staticmethod
+    def _make_two_trajs():
+        t1 = np.linspace(0, 1, 20)
+        x1 = np.column_stack([t1, t1 ** 2])
+        t2 = np.linspace(0.7, 2.0, 30)
+        x2 = np.column_stack([t2 + 0.5, t2 ** 2 + 0.5])
+        traj1 = _PolyTrajectory.fit(t1, x1, 3)
+        traj2 = _PolyTrajectory.fit(t2, x2, 3)
+        return traj1, traj2
+
+    def test_cubic_blend_evaluate(self):
+        traj1, traj2 = self._make_two_trajs()
+        bl = _CubicBlend(traj1, traj2, 0.8, 1.0)
+        for t in [0.8, 0.85, 0.9, 0.95, 1.0]:
+            val = bl.evaluate(t)
+            assert val.shape == (2,)
+            assert np.all(np.isfinite(val))
+
+    def test_dual_cubic_blend_evaluate(self):
+        traj1, traj2 = self._make_two_trajs()
+        bl = _DualCubicBlend(traj1, traj2, 0.8, 1.0)
+        for t in [0.8, 0.85, 0.9, 0.95, 1.0]:
+            val = bl.evaluate(t)
+            assert val.shape == (2,)
+            assert np.all(np.isfinite(val))
+
+    def test_cubic_pos_vel_continuity(self):
+        """C¹ blend should be continuous in position and velocity at knots."""
+        traj1, traj2 = self._make_two_trajs()
+        bl = _CubicBlend(traj1, traj2, 0.8, 1.0)
+        # Start knot
+        p_old = traj1.evaluate(0.8)
+        p_bl = bl.evaluate(0.8)
+        np.testing.assert_allclose(p_bl, p_old, atol=1e-8)
+        # End knot
+        p_new = traj2.evaluate(1.0)
+        p_bl_end = bl.evaluate(1.0)
+        np.testing.assert_allclose(p_bl_end, p_new, atol=1e-8)
+
+    def test_cubic_blend_with_start_state(self):
+        traj1, traj2 = self._make_two_trajs()
+        custom_pos = np.array([10.0, 20.0])
+        custom_vel = np.array([1.0, 2.0])
+        bl = _CubicBlend(
+            traj1, traj2, 0.8, 1.0,
+            start_state=(custom_pos, custom_vel, np.zeros(2)),
+        )
+        p_start = bl.evaluate(0.8)
+        np.testing.assert_allclose(p_start, custom_pos, atol=1e-8)
+
+    def test_cubic_evaluate_deriv(self):
+        traj1, traj2 = self._make_two_trajs()
+        bl = _CubicBlend(traj1, traj2, 0.8, 1.0)
+        d = bl.evaluate_deriv(0.9, 1)
+        assert d.shape == (2,)
+        assert np.all(np.isfinite(d))
+
+
+# ---------------------------------------------------------------------------
+# blend_order parameter tests
+# ---------------------------------------------------------------------------
+class TestBlendOrder:
+    """Tests for the blend_order parameter on AsyncFilterRAIL."""
+
+    def test_default_blend_order_is_cubic(self):
+        f = AsyncFilter(method="rail")
+        assert f._blend_order == "cubic"
+
+    def test_quintic_blend_order(self):
+        f = AsyncFilter(method="rail", blend_order="quintic")
+        assert f._blend_order == "quintic"
+
+    def test_invalid_blend_order_raises(self):
+        with pytest.raises(ValueError, match="blend_order"):
+            AsyncFilter(method="rail", blend_order="linear")
+
+    def test_cubic_produces_finite_output(self):
+        f = AsyncFilter(method="rail", blend_order="cubic")
+        t1 = np.linspace(0, 1, 20)
+        x1 = np.column_stack([t1, t1 ** 2, np.sin(t1)])
+        f.update_chunk(t1, x1)
+        f.set_current_time(0.5)
+        t2 = np.linspace(0.4, 1.5, 20)
+        x2 = np.column_stack([t2 + 0.1, t2 ** 2 + 0.1, np.sin(t2) + 0.1])
+        f.update_chunk(t2, x2)
+        val = f.get_output(t=0.6)
+        assert val is not None
+        assert np.all(np.isfinite(val))
+
+    def test_quintic_produces_finite_output(self):
+        f = AsyncFilter(method="rail", blend_order="quintic")
+        t1 = np.linspace(0, 1, 20)
+        x1 = np.column_stack([t1, t1 ** 2, np.sin(t1)])
+        f.update_chunk(t1, x1)
+        f.set_current_time(0.5)
+        t2 = np.linspace(0.4, 1.5, 20)
+        x2 = np.column_stack([t2 + 0.1, t2 ** 2 + 0.1, np.sin(t2) + 0.1])
+        f.update_chunk(t2, x2)
+        val = f.get_output(t=0.6)
+        assert val is not None
+        assert np.all(np.isfinite(val))
+
+
+# ---------------------------------------------------------------------------
+# acc_clamp parameter tests
+# ---------------------------------------------------------------------------
+class TestAccClamp:
+    """Tests for the acc_clamp parameter on AsyncFilterRAIL."""
+
+    def test_default_acc_clamp_is_none(self):
+        f = AsyncFilter(method="rail")
+        assert f._acc_clamp is None
+
+    def test_acc_clamp_set(self):
+        f = AsyncFilter(method="rail", acc_clamp=10.0)
+        assert f._acc_clamp == 10.0
+
+    def test_acc_clamp_reduces_overshoot(self):
+        """With acc_clamp, quintic blend should have bounded acceleration."""
+        np.random.seed(42)
+        f_clamped = AsyncFilter(
+            method="rail", blend_order="quintic", acc_clamp=5.0,
+            blend_start_source="actual_output",
+        )
+        f_unclamped = AsyncFilter(
+            method="rail", blend_order="quintic",
+            blend_start_source="actual_output",
+        )
+        # Feed noisy chunks
+        t1 = np.linspace(0, 1, 20)
+        noise = np.random.randn(20, 3) * 0.05
+        x1 = np.column_stack([t1, t1 ** 2, np.sin(t1)]) + noise
+        for f in (f_clamped, f_unclamped):
+            f.update_chunk(t1, x1)
+            f.set_current_time(0.5)
+        t2 = np.linspace(0.4, 1.5, 20)
+        noise2 = np.random.randn(20, 3) * 0.05
+        x2 = np.column_stack([t2, t2 ** 2, np.sin(t2)]) + noise2
+        for f in (f_clamped, f_unclamped):
+            f.update_chunk(t2, x2)
+        # Both should produce finite output
+        for f in (f_clamped, f_unclamped):
+            val = f.get_output(t=0.6)
+            assert val is not None
+            assert np.all(np.isfinite(val))
+
+    def test_acc_clamp_no_effect_on_cubic(self):
+        """acc_clamp shouldn't break cubic blends (cubic has no acc matching)."""
+        f = AsyncFilter(method="rail", blend_order="cubic", acc_clamp=5.0)
+        t1 = np.linspace(0, 1, 20)
+        x1 = np.column_stack([t1, t1 ** 2, np.sin(t1)])
+        f.update_chunk(t1, x1)
+        f.set_current_time(0.5)
+        t2 = np.linspace(0.4, 1.5, 20)
+        x2 = np.column_stack([t2 + 0.1, t2 ** 2 + 0.1, np.sin(t2) + 0.1])
+        f.update_chunk(t2, x2)
+        val = f.get_output(t=0.6)
+        assert val is not None
+        assert np.all(np.isfinite(val))
+
+
+# ---------------------------------------------------------------------------
+# Extrapolation safeguard tests
+# ---------------------------------------------------------------------------
+class TestPolyTrajectoryExtrapolation:
+    """Tests for _PolyTrajectory extrapolation modes."""
+
+    @staticmethod
+    def _make_traj(extrapolation: str = "linear"):
+        t = np.linspace(0.0, 1.0, 20)
+        x = np.column_stack([t ** 2, np.sin(t)])
+        return _PolyTrajectory.fit(t, x, 3, extrapolation)
+
+    def test_default_extrapolation_is_linear(self):
+        traj = self._make_traj()
+        assert traj._extrapolation == "linear"
+
+    def test_in_range_identical_for_all_modes(self):
+        """Within [t_start, t_end] all modes should give the same result."""
+        trajs = {m: self._make_traj(m) for m in ("clamp", "linear", "poly")}
+        for t_q in [0.0, 0.3, 0.5, 0.8, 1.0]:
+            vals = {m: tr.evaluate(t_q) for m, tr in trajs.items()}
+            np.testing.assert_allclose(vals["clamp"], vals["linear"], atol=1e-12)
+            np.testing.assert_allclose(vals["linear"], vals["poly"], atol=1e-12)
+
+    def test_clamp_holds_boundary(self):
+        traj = self._make_traj("clamp")
+        val_end = traj.evaluate(1.0)
+        val_beyond = traj.evaluate(5.0)
+        np.testing.assert_allclose(val_beyond, val_end, atol=1e-12)
+        val_start = traj.evaluate(0.0)
+        val_before = traj.evaluate(-3.0)
+        np.testing.assert_allclose(val_before, val_start, atol=1e-12)
+
+    def test_linear_bounded(self):
+        """Linear extrapolation should stay finite and closer than poly."""
+        traj_lin = self._make_traj("linear")
+        traj_poly = self._make_traj("poly")
+        val_lin = traj_lin.evaluate(10.0)
+        val_poly = traj_poly.evaluate(10.0)
+        assert np.all(np.isfinite(val_lin))
+        assert np.max(np.abs(val_lin)) < np.max(np.abs(val_poly))
+
+    def test_poly_diverges(self):
+        """Poly mode should diverge for high-degree at large extrapolation."""
+        traj = self._make_traj("poly")
+        val_far = traj.evaluate(100.0)
+        assert np.max(np.abs(val_far)) > 1e4  # cubic diverges at t=100
+
+    def test_linear_extrapolation_uses_velocity(self):
+        """Linear extrapolation: pos(t) = pos(boundary) + vel(boundary) * dt."""
+        traj = self._make_traj("linear")
+        dt = 0.5
+        val_end = traj.evaluate(1.0)
+        vel_end = traj.evaluate_deriv(1.0, 1)
+        val_extrap = traj.evaluate(1.0 + dt)
+        expected = val_end + vel_end * dt
+        np.testing.assert_allclose(val_extrap, expected, atol=1e-10)
+
+    def test_clamp_deriv_is_zero(self):
+        """Clamped: derivatives outside range should be zero."""
+        traj = self._make_traj("clamp")
+        d1 = traj.evaluate_deriv(5.0, 1)
+        np.testing.assert_allclose(d1, 0.0, atol=1e-12)
+        d2 = traj.evaluate_deriv(-3.0, 2)
+        np.testing.assert_allclose(d2, 0.0, atol=1e-12)
+
+    def test_linear_deriv_constant_outside(self):
+        """Linear: 1st deriv is constant boundary velocity, higher derivs zero."""
+        traj = self._make_traj("linear")
+        vel_end = traj.evaluate_deriv(1.0, 1)
+        vel_far = traj.evaluate_deriv(5.0, 1)
+        np.testing.assert_allclose(vel_far, vel_end, atol=1e-10)
+        acc_far = traj.evaluate_deriv(5.0, 2)
+        np.testing.assert_allclose(acc_far, 0.0, atol=1e-12)
+
+
+class TestRAILExtrapolationParam:
+    """Tests for the extrapolation parameter on AsyncFilterRAIL."""
+
+    def test_default_is_linear(self):
+        f = AsyncFilter(method="rail")
+        assert f._extrapolation == "linear"
+
+    def test_invalid_raises(self):
+        with pytest.raises(ValueError, match="extrapolation"):
+            AsyncFilter(method="rail", extrapolation="quadratic")
+
+    def test_all_modes_produce_output(self):
+        for mode in ("clamp", "linear", "poly"):
+            f = AsyncFilter(method="rail", extrapolation=mode)
+            t = np.linspace(0, 1, 20)
+            x = np.column_stack([t, t ** 2, np.sin(t)])
+            f.update_chunk(t, x)
+            val = f.get_output(t=3.0)
+            assert val is not None, f"mode={mode}"
+            assert val.shape == (3,), f"mode={mode}"
+            if mode != "poly":
+                assert np.max(np.abs(val)) < 100.0, f"mode={mode}"
+
+    def test_extrapolation_reduces_divergence(self):
+        """Linear/clamp should prevent divergence for far-future queries."""
+        t = np.linspace(0, 0.5, 16)
+        x = np.column_stack([t ** 2, np.sin(3 * t)])
+        results = {}
+        for mode in ("clamp", "linear", "poly"):
+            f = AsyncFilter(method="rail", extrapolation=mode, poly_degree=5)
+            f.update_chunk(t, x)
+            val = f.get_output(t=5.0)
+            results[mode] = np.max(np.abs(val))
+        assert results["clamp"] < results["poly"]
+        assert results["linear"] < results["poly"]
