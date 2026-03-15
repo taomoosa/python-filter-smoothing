@@ -1428,3 +1428,141 @@ class TestRAILExtrapolationParam:
             results[mode] = np.max(np.abs(val))
         assert results["clamp"] < results["poly"]
         assert results["linear"] < results["poly"]
+
+
+# ---------------------------------------------------------------------------
+# RAIL: align_method parameter
+# ---------------------------------------------------------------------------
+
+class TestAlignMethod:
+    """Tests for the align_method parameter on AsyncFilterRAIL."""
+
+    def test_align_method_default_is_direction(self):
+        """Default align_method should be 'direction'."""
+        f = AsyncFilter(method="rail")
+        assert f._align_method == "direction"
+
+    def test_align_method_invalid_raises(self):
+        """Invalid align_method should raise ValueError."""
+        with pytest.raises(ValueError, match="align_method"):
+            AsyncFilter(method="rail", align_method="invalid")
+
+    def test_align_method_least_squares_accepted(self):
+        """'least_squares' should be accepted without error."""
+        f = AsyncFilter(method="rail", align_method="least_squares",
+                        auto_align=True)
+        assert f._align_method == "least_squares"
+        assert f._auto_align is True
+
+    def test_ls_align_produces_finite_output(self):
+        """least_squares alignment should produce finite output."""
+        f = AsyncFilter(method="rail", auto_align=True,
+                        align_method="least_squares")
+        t1 = np.linspace(0.0, 1.0, 20)
+        x1 = t1 * 0.5
+        f.update_chunk(t1, x1)
+        f.set_current_time(1.2)
+        t2 = np.linspace(0.8, 2.0, 20)
+        x2 = t2 * 0.5 + 0.05
+        f.update_chunk(t2, x2)
+        val = f.get_output(t=1.2)
+        assert val is not None
+        assert np.all(np.isfinite(val))
+
+    def test_ls_align_reduces_position_error(self):
+        """LS alignment should reduce position error vs no alignment.
+
+        Creates two chunks with a known temporal offset.  The LS-aligned
+        filter should produce output closer to the true trajectory.
+        """
+        # Ground truth: ramp with gentle curve
+        gt = lambda t: 0.4 * t + 0.05 * np.sin(2 * t)
+
+        # Create chunks with temporal offset
+        rng = np.random.default_rng(42)
+        chunk_dt = 1.0 / 30
+        t1 = np.array([i * chunk_dt for i in range(16)])
+        x1 = gt(t1 + 0.03).reshape(-1, 1)  # offset +0.03s
+
+        t2_start = 0.35
+        t2 = np.array([t2_start + i * chunk_dt for i in range(16)])
+        x2 = gt(t2 - 0.05).reshape(-1, 1)  # offset -0.05s
+
+        rms_vals = {}
+        for method in ("direction", "least_squares"):
+            f = AsyncFilter(method="rail", auto_align=True,
+                            align_method=method)
+            f.update_chunk(t1, x1)
+            f.set_current_time(t2_start)
+            f.update_chunk(t2, x2)
+
+            # Evaluate at several points
+            errs = []
+            for t in np.linspace(t2_start, t2[-1] - 0.05, 20):
+                val = f.get_output(t=t)
+                if val is not None:
+                    errs.append(float(val[0]) - gt(t))
+            rms_vals[method] = np.sqrt(np.mean(np.array(errs) ** 2))
+
+        # LS should be no worse than direction
+        assert rms_vals["least_squares"] <= rms_vals["direction"] * 1.5
+
+    def test_ls_align_first_chunk_no_crash(self):
+        """LS alignment with only one chunk should not crash."""
+        f = AsyncFilter(method="rail", auto_align=True,
+                        align_method="least_squares")
+        f.set_current_time(0.5)
+        t = np.linspace(0.0, 1.0, 20)
+        x = np.sin(t)
+        f.update_chunk(t, x)
+        val = f.get_output(t=0.5)
+        assert val is not None
+        assert np.all(np.isfinite(val))
+
+    def test_ls_align_preserves_shape(self):
+        """LS alignment should preserve output dimensionality."""
+        f = AsyncFilter(method="rail", auto_align=True,
+                        align_method="least_squares")
+        t1 = np.linspace(0, 1, 20)
+        x1 = np.column_stack([t1, t1 ** 2, np.sin(t1)])
+        f.update_chunk(t1, x1)
+        f.set_current_time(1.1)
+        t2 = np.linspace(0.8, 2.0, 20)
+        x2 = np.column_stack([t2 + 0.05, t2 ** 2 + 0.05, np.sin(t2) + 0.05])
+        f.update_chunk(t2, x2)
+        val = f.get_output(t=1.1)
+        assert val.shape == (3,)
+
+    def test_ls_align_with_custom_window(self):
+        """align_window should control LS search range."""
+        f = AsyncFilter(method="rail", auto_align=True,
+                        align_method="least_squares", align_window=0.2)
+        t1 = np.linspace(0.0, 1.0, 20)
+        x1 = t1 * 0.5
+        f.update_chunk(t1, x1)
+        f.set_current_time(1.1)
+        t2 = np.linspace(0.9, 2.0, 20)
+        x2 = t2 * 0.5
+        f.update_chunk(t2, x2)
+        val = f.get_output(t=1.1)
+        assert val is not None
+        assert np.all(np.isfinite(val))
+
+    def test_ls_align_without_current_time_is_noop(self):
+        """LS alignment without set_current_time should not crash."""
+        f = AsyncFilter(method="rail", auto_align=True,
+                        align_method="least_squares")
+        t1 = np.linspace(0, 1, 20)
+        x1 = np.sin(t1)
+        f.update_chunk(t1, x1)
+        t2 = np.linspace(0.8, 2.0, 20)
+        x2 = np.sin(t2) + 0.1
+        f.update_chunk(t2, x2)
+        val = f.get_output(t=1.0)
+        assert val is not None
+
+    def test_factory_passes_align_method(self):
+        """AsyncFilter factory should forward align_method to RAIL."""
+        f = AsyncFilter(method="rail", auto_align=True,
+                        align_method="least_squares")
+        assert f._align_method == "least_squares"

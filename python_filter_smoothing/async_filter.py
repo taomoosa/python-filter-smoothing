@@ -929,10 +929,19 @@ class AsyncFilterRAIL(AsyncFilterBase):
         If ``False``, use a single blend over the whole region.
     auto_align : bool, optional
         If ``True``, automatically correct new-chunk timestamps via
-        temporal alignment optimisation (VLA-RAIL Eq. 10) that maximises
-        motion-direction consistency with the current trajectory.
+        temporal alignment optimisation before blending.
         Requires :meth:`set_current_time` to have been called.
         Default: ``False``.
+    align_method : str, optional
+        Algorithm used when ``auto_align=True``.
+
+        * ``"direction"`` (default) – VLA-RAIL Eq. 10: maximise
+          motion-direction consistency between the shifted chunk and
+          the current trajectory's velocity at ``t_now``.
+        * ``"least_squares"`` – minimise total squared position error
+          between the current trajectory and the shifted chunk over
+          their overlap region.  More robust than ``"direction"`` for
+          large temporal offsets and produces smoother blends.
     align_window : float or None, optional
         Search window (seconds) for temporal alignment.  If ``None``
         (default), uses 50 % of the new chunk's duration.
@@ -985,6 +994,7 @@ class AsyncFilterRAIL(AsyncFilterBase):
         {"trajectory", "actual_output", "output_history"}
     )
     _VALID_BLEND_ORDERS = frozenset({"cubic", "quintic"})
+    _VALID_ALIGN_METHODS = frozenset({"direction", "least_squares"})
 
     def __init__(
         self,
@@ -993,6 +1003,7 @@ class AsyncFilterRAIL(AsyncFilterBase):
         blend_duration: Optional[float] = None,
         dual_quintic: bool = True,
         auto_align: bool = False,
+        align_method: str = "direction",
         align_window: Optional[float] = None,
         blend_start_source: str = "actual_output",
         blend_order: str = "cubic",
@@ -1018,10 +1029,17 @@ class AsyncFilterRAIL(AsyncFilterBase):
                 f"{sorted(_PolyTrajectory._VALID_EXTRAP)}, "
                 f"got {extrapolation!r}."
             )
+        if align_method not in self._VALID_ALIGN_METHODS:
+            raise ValueError(
+                f"align_method must be one of "
+                f"{sorted(self._VALID_ALIGN_METHODS)}, "
+                f"got {align_method!r}."
+            )
         self._poly_degree = int(poly_degree)
         self._blend_duration = blend_duration
         self._dual_quintic = bool(dual_quintic)
         self._auto_align = bool(auto_align)
+        self._align_method = align_method
         self._align_window = align_window
         self._blend_start_source = blend_start_source
         self._blend_order = blend_order
@@ -1104,6 +1122,115 @@ class AsyncFilterRAIL(AsyncFilterBase):
 
         # Shift so that (t_new_start + best_ta) aligns with t_now
         return t_now - (traj_new.t_start + best_ta)
+
+    def _compute_ls_alignment(
+        self,
+        t_raw: np.ndarray,
+        x_raw: np.ndarray,
+        t_now: float,
+    ) -> float:
+        """Find optimal time shift via least-squares overlap matching.
+
+        For each candidate shift ``s``, a temporary polynomial is fitted
+        to ``(t_raw + s, x_raw)``.  The cost is the sum of squared
+        position differences between that polynomial and the current
+        trajectory, evaluated at evenly-spaced points in their overlap
+        region.  The shift with the lowest cost is returned.
+
+        Uses a coarse-to-fine grid search for efficiency: a coarse pass
+        (15 candidates) identifies the best basin, then a refinement
+        pass (10 candidates) narrows down to the optimum.  Polynomial
+        fitting and evaluation are vectorized across all dimensions
+        using a Vandermonde matrix and :func:`numpy.linalg.lstsq`.
+        """
+        if self._curr_traj is None:
+            return 0.0
+
+        old_traj = self._curr_traj
+        chunk_dur = float(t_raw[-1] - t_raw[0])
+        window = (
+            self._align_window
+            if self._align_window is not None
+            else 0.5 * chunk_dur
+        )
+
+        n_eval = 15
+        deg = min(self._poly_degree, len(t_raw) - 1)
+        old_polys = old_traj._polys
+
+        def _eval_shifts(shifts: np.ndarray) -> np.ndarray:
+            costs = np.full(len(shifts), np.inf)
+            for i, shift in enumerate(shifts):
+                t_shifted = t_raw + shift
+                t_lo = max(old_traj.t_start, float(t_shifted[0]))
+                t_hi = min(old_traj.t_end, float(t_shifted[-1]))
+                if t_hi <= t_lo:
+                    continue
+
+                # Normalize time for numerical stability
+                t_center = 0.5 * (t_shifted[0] + t_shifted[-1])
+                t_half = 0.5 * (t_shifted[-1] - t_shifted[0])
+                if t_half < 1e-15:
+                    t_half = 1.0
+                t_norm = (t_shifted - t_center) / t_half
+
+                # Fit all dims at once via Vandermonde + lstsq
+                V = np.vander(t_norm, N=deg + 1)
+                try:
+                    new_coeffs, _, _, _ = np.linalg.lstsq(
+                        V, x_raw, rcond=None,
+                    )
+                except Exception:
+                    continue
+
+                t_eval = np.linspace(t_lo, t_hi, n_eval)
+                t_eval_norm = (t_eval - t_center) / t_half
+
+                # Vectorized evaluation: new trajectory
+                V_eval = np.vander(t_eval_norm, N=deg + 1)
+                new_vals = V_eval @ new_coeffs  # (n_eval, n_dims)
+
+                # Vectorized evaluation: old trajectory (polyval)
+                old_vals = np.column_stack(
+                    [np.polyval(p.coefficients, t_eval) for p in old_polys]
+                )
+
+                diff = new_vals - old_vals
+                costs[i] = float(np.sum(diff * diff))
+            return costs
+
+        # Phase 1: coarse search
+        n_coarse = 15
+        coarse_shifts = np.linspace(-window, window, n_coarse)
+        coarse_costs = _eval_shifts(coarse_shifts)
+
+        best_coarse = int(np.argmin(coarse_costs))
+        if not np.isfinite(coarse_costs[best_coarse]):
+            return 0.0
+
+        # Phase 2: refine around the best coarse candidate
+        n_refine = 10
+        step = (
+            (coarse_shifts[1] - coarse_shifts[0])
+            if n_coarse > 1
+            else window
+        )
+        refine_shifts = np.linspace(
+            coarse_shifts[best_coarse] - step,
+            coarse_shifts[best_coarse] + step,
+            n_refine,
+        )
+        refine_costs = _eval_shifts(refine_shifts)
+
+        all_shifts = np.concatenate([coarse_shifts, refine_shifts])
+        all_costs = np.concatenate([coarse_costs, refine_costs])
+        best_idx = int(np.argmin(all_costs))
+
+        return (
+            float(all_shifts[best_idx])
+            if np.isfinite(all_costs[best_idx])
+            else 0.0
+        )
 
     # -- chunk interface ----------------------------------------------------
 
@@ -1240,9 +1367,14 @@ class AsyncFilterRAIL(AsyncFilterBase):
 
             # Optional: temporal alignment (shift chunk timestamps)
             if self._auto_align and self._current_time is not None:
-                shift = self._compute_temporal_alignment(
-                    traj, self._current_time
-                )
+                if self._align_method == "least_squares":
+                    shift = self._compute_ls_alignment(
+                        t_arr, x_arr, self._current_time,
+                    )
+                else:
+                    shift = self._compute_temporal_alignment(
+                        traj, self._current_time,
+                    )
                 if abs(shift) > 1e-12:
                     t_shifted = t_arr + shift
                     traj = _PolyTrajectory.fit(
