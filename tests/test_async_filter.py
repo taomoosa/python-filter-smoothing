@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 from python_filter_smoothing import AsyncFilter
 from python_filter_smoothing.async_filter import (
+    AsyncFilterRTC,
+    AsyncFilterRTCRAIL,
     _PolyTrajectory,
     _CubicBlend,
     _DualCubicBlend,
@@ -1566,3 +1568,1201 @@ class TestAlignMethod:
         f = AsyncFilter(method="rail", auto_align=True,
                         align_method="least_squares")
         assert f._align_method == "least_squares"
+
+
+# ---------------------------------------------------------------------------
+# RTC (Real-Time Chunking)
+# ---------------------------------------------------------------------------
+
+class TestAsyncFilterRTCBasic:
+    """Basic functionality of AsyncFilterRTC."""
+
+    def _make_filter(self, **kwargs):
+        defaults = dict(
+            prediction_horizon=10, dt=0.02, min_execution_horizon=1,
+            initial_delay=1,
+        )
+        defaults.update(kwargs)
+        return AsyncFilter(method="rtc", **defaults)
+
+    def _make_chunk(self, t_start=0.0, H=10, dt=0.02, D=2):
+        t = np.arange(H) * dt + t_start
+        x = np.column_stack([np.sin(t * 2 * np.pi), np.cos(t * 2 * np.pi)])
+        if D == 1:
+            x = x[:, :1]
+        return t, x
+
+    def test_factory_creates_rtc(self):
+        f = self._make_filter()
+        assert type(f).__name__ == "AsyncFilterRTC"
+
+    def test_returns_none_before_update(self):
+        f = self._make_filter()
+        assert f.get_output() is None
+        assert f.get_prefix() is None
+        assert f.current_chunk is None
+
+    def test_update_chunk_and_get_output(self):
+        f = self._make_filter()
+        t, x = self._make_chunk()
+        f.update_chunk(t, x)
+        out = f.get_output(t[0])
+        assert out is not None
+        np.testing.assert_allclose(out, x[0], atol=1e-12)
+
+    def test_get_output_at_endpoints(self):
+        f = self._make_filter()
+        t, x = self._make_chunk()
+        f.update_chunk(t, x)
+        np.testing.assert_allclose(f.get_output(t[0]), x[0], atol=1e-12)
+        np.testing.assert_allclose(f.get_output(t[-1]), x[-1], atol=1e-12)
+
+    def test_get_output_interpolates(self):
+        f = self._make_filter()
+        t, x = self._make_chunk()
+        f.update_chunk(t, x)
+        mid_t = (t[3] + t[4]) / 2
+        out = f.get_output(mid_t)
+        assert out is not None
+        # Should be between x[3] and x[4] (linear interp)
+        for d in range(x.shape[1]):
+            lo = min(x[3, d], x[4, d])
+            hi = max(x[3, d], x[4, d])
+            assert lo - 1e-12 <= out[d] <= hi + 1e-12
+
+    def test_get_output_default_time(self):
+        """get_output(None) returns the last action of the current chunk."""
+        f = self._make_filter()
+        t, x = self._make_chunk()
+        f.update_chunk(t, x)
+        out = f.get_output()
+        np.testing.assert_allclose(out, x[-1], atol=1e-12)
+
+    def test_get_prefix_returns_tuple(self):
+        f = self._make_filter()
+        t, x = self._make_chunk()
+        f.update_chunk(t, x)
+        prefix = f.get_prefix()
+        assert prefix is not None
+        t_p, x_p, d = prefix
+        assert isinstance(d, int)
+        assert d >= 0
+        assert t_p.ndim == 1
+        assert x_p.ndim == 2
+
+    def test_delay_estimate_initial(self):
+        f = self._make_filter(initial_delay=3)
+        assert f.delay_estimate == 3
+
+    def test_record_delay(self):
+        f = self._make_filter(initial_delay=1, delay_estimate_method="max")
+        f.record_delay(5)
+        assert f.delay_estimate == 5
+
+    def test_delay_estimate_mean(self):
+        f = self._make_filter(
+            initial_delay=0, delay_estimate_method="mean",
+            delay_buffer_size=3,
+        )
+        f.record_delay(2)
+        f.record_delay(4)
+        # buffer: [0, 2, 4], mean = 2
+        assert f.delay_estimate == 2
+
+    def test_delay_estimate_ema(self):
+        f = self._make_filter(
+            initial_delay=0, delay_estimate_method="ema",
+            delay_buffer_size=10,
+        )
+        f.record_delay(10)
+        d = f.delay_estimate
+        assert d >= 1  # should pick up the large delay
+
+    def test_execution_horizon(self):
+        f = self._make_filter(min_execution_horizon=3, initial_delay=1)
+        assert f.execution_horizon == 3  # max(1, 3)
+        f.record_delay(5)
+        assert f.execution_horizon == 5  # max(5, 3)
+
+    def test_clear_resets_state(self):
+        f = self._make_filter()
+        t, x = self._make_chunk()
+        f.update_chunk(t, x)
+        f.set_current_time(0.1)
+        f.clear()
+        assert f.get_output() is None
+        assert f.get_prefix() is None
+        assert f.current_chunk is None
+
+    def test_1d_input(self):
+        f = self._make_filter(prediction_horizon=5)
+        t = np.linspace(0, 0.08, 5)
+        x = np.sin(t)  # 1D
+        f.update_chunk(t, x)
+        out = f.get_output(t[2])
+        assert out.shape == (1,)
+
+    def test_mismatched_shapes_raises(self):
+        f = self._make_filter()
+        t = np.array([0.0, 0.02, 0.04])
+        x = np.ones((5, 2))
+        with pytest.raises(ValueError, match="samples"):
+            f.update_chunk(t, x)
+
+    def test_invalid_params(self):
+        with pytest.raises(ValueError):
+            AsyncFilter(method="rtc", prediction_horizon=1, dt=0.02)
+        with pytest.raises(ValueError):
+            AsyncFilter(method="rtc", prediction_horizon=10, dt=0.02,
+                        min_execution_horizon=0)
+        with pytest.raises(ValueError):
+            AsyncFilter(method="rtc", prediction_horizon=10, dt=-1)
+        with pytest.raises(ValueError):
+            AsyncFilter(method="rtc", prediction_horizon=10, dt=0.02,
+                        delay_estimate_method="bad")
+        with pytest.raises(ValueError):
+            AsyncFilter(method="rtc", prediction_horizon=10, dt=0.02,
+                        blend_mode="bad")
+        with pytest.raises(ValueError):
+            AsyncFilter(method="rtc", prediction_horizon=10, dt=0.02,
+                        interpolation="bad")
+        with pytest.raises(ValueError):
+            AsyncFilter(method="rtc", prediction_horizon=10, dt=0.02,
+                        extrapolation="bad")
+
+
+class TestAsyncFilterRTCSoftMask:
+    """Tests for the soft mask computation (Eq. 5 of arXiv:2506.07339)."""
+
+    def _make_filter(self, H=10, **kwargs):
+        return AsyncFilter(method="rtc", prediction_horizon=H, dt=0.02,
+                           **kwargs)
+
+    def test_shape(self):
+        f = self._make_filter(H=10)
+        W = f.get_soft_mask(delay=2)
+        assert W.shape == (10,)
+
+    def test_frozen_region_is_one(self):
+        f = self._make_filter(H=10)
+        W = f.get_soft_mask(delay=3)
+        np.testing.assert_allclose(W[:3], 1.0)
+
+    def test_free_region_is_zero(self):
+        """Last s entries should be zero."""
+        f = self._make_filter(H=10, min_execution_horizon=2)
+        W = f.get_soft_mask(delay=2)
+        # s = max(d, s_min) = max(2, 2) = 2 → last 2 are zero
+        np.testing.assert_allclose(W[-2:], 0.0)
+
+    def test_intermediate_decays(self):
+        f = self._make_filter(H=20, min_execution_horizon=2)
+        W = f.get_soft_mask(delay=3)
+        # Intermediate region: indices 3 to H-s-1 = 20-3-1 = 16
+        intermediate = W[3:17]
+        # Should be monotonically decreasing
+        assert np.all(np.diff(intermediate) <= 1e-15)
+
+    def test_values_in_unit_interval(self):
+        f = self._make_filter(H=16, min_execution_horizon=4)
+        W = f.get_soft_mask(delay=4)
+        assert np.all(W >= -1e-15)
+        assert np.all(W <= 1.0 + 1e-15)
+
+    def test_delay_zero(self):
+        f = self._make_filter(H=8, min_execution_horizon=1)
+        W = f.get_soft_mask(delay=0)
+        # No frozen region; first element should not be 1.0
+        assert W[0] < 1.0 or W[0] == 0.0  # d=0 means no frozen
+
+    def test_override_delay(self):
+        """Explicit delay should override the internal estimate."""
+        f = self._make_filter(H=10, initial_delay=1)
+        W1 = f.get_soft_mask(delay=1)
+        W5 = f.get_soft_mask(delay=5)
+        assert not np.allclose(W1, W5)
+
+
+class TestAsyncFilterRTCBlending:
+    """Tests for chunk transition blending."""
+
+    def _make_filter(self, blend_mode="soft_mask", **kwargs):
+        defaults = dict(prediction_horizon=10, dt=0.02)
+        defaults.update(kwargs)
+        return AsyncFilter(method="rtc", blend_mode=blend_mode, **defaults)
+
+    def test_blend_none_uses_new_chunk(self):
+        """With blend_mode='none', output comes only from the new chunk."""
+        f = self._make_filter(blend_mode="none")
+        t1, x1 = np.linspace(0, 0.18, 10), np.zeros((10, 2))
+        t2, x2 = np.linspace(0.08, 0.26, 10), np.ones((10, 2))
+        f.update_chunk(t1, x1)
+        f.update_chunk(t2, x2)
+        # Query in overlap (0.08..0.18) → should be exactly from x2
+        out = f.get_output(0.12)
+        np.testing.assert_allclose(out, [1.0, 1.0], atol=1e-12)
+
+    def test_blend_linear_crossfade(self):
+        f = self._make_filter(blend_mode="linear")
+        t1 = np.linspace(0, 0.18, 10)
+        x1 = np.zeros((10, 1))
+        t2 = np.linspace(0.08, 0.26, 10)
+        x2 = np.ones((10, 1))
+        f.update_chunk(t1, x1)
+        f.update_chunk(t2, x2)
+        # Midpoint of overlap
+        mid = (0.08 + 0.18) / 2
+        out = f.get_output(mid)
+        # Should be ~0.5 (linear blend)
+        assert 0.3 < out[0] < 0.7
+
+    def test_blend_soft_mask_smooth(self):
+        f = self._make_filter(blend_mode="soft_mask")
+        t1 = np.linspace(0, 0.18, 10)
+        x1 = np.zeros((10, 1))
+        t2 = np.linspace(0.08, 0.26, 10)
+        x2 = np.ones((10, 1))
+        f.update_chunk(t1, x1)
+        f.update_chunk(t2, x2)
+        # Early in overlap → closer to old (0)
+        out_early = f.get_output(0.085)
+        # Late in overlap → closer to new (1)
+        out_late = f.get_output(0.175)
+        assert out_early[0] < out_late[0]
+
+    def test_no_blend_before_overlap(self):
+        """Query before overlap uses the new chunk directly."""
+        f = self._make_filter(blend_mode="soft_mask")
+        t1 = np.linspace(0, 0.18, 10)
+        x1 = np.zeros((10, 1))
+        t2 = np.linspace(0.10, 0.28, 10)
+        x2 = np.ones((10, 1))
+        f.update_chunk(t1, x1)
+        f.update_chunk(t2, x2)
+        # Query past the overlap region
+        out = f.get_output(0.25)
+        np.testing.assert_allclose(out, [1.0], atol=1e-12)
+
+
+class TestAsyncFilterRTCExtrapolation:
+    """Tests for extrapolation behaviour."""
+
+    def _make_filter(self, extrapolation="linear", **kwargs):
+        return AsyncFilter(method="rtc", prediction_horizon=5, dt=0.02,
+                           extrapolation=extrapolation, **kwargs)
+
+    def test_clamp_before_start(self):
+        f = self._make_filter(extrapolation="clamp")
+        t = np.linspace(0.1, 0.18, 5)
+        x = np.arange(5).reshape(-1, 1).astype(float)
+        f.update_chunk(t, x)
+        out = f.get_output(0.0)  # before chunk start
+        np.testing.assert_allclose(out, x[0], atol=1e-12)
+
+    def test_clamp_after_end(self):
+        f = self._make_filter(extrapolation="clamp")
+        t = np.linspace(0.0, 0.08, 5)
+        x = np.arange(5).reshape(-1, 1).astype(float)
+        f.update_chunk(t, x)
+        out = f.get_output(1.0)  # well past end
+        np.testing.assert_allclose(out, x[-1], atol=1e-12)
+
+    def test_linear_extrapolation_after_end(self):
+        f = self._make_filter(extrapolation="linear")
+        t = np.array([0.0, 0.02, 0.04, 0.06, 0.08])
+        x = np.arange(5).reshape(-1, 1).astype(float)
+        f.update_chunk(t, x)
+        # Linear extrapolation: slope = 1/0.02 = 50
+        out = f.get_output(0.10)
+        expected = 4.0 + 50 * 0.02  # = 5.0
+        np.testing.assert_allclose(out, [expected], atol=1e-10)
+
+
+class TestAsyncFilterRTCInterpolation:
+    """Tests for PCHIP interpolation."""
+
+    def test_pchip_interpolation(self):
+        f = AsyncFilter(method="rtc", prediction_horizon=8, dt=0.02,
+                        interpolation="pchip")
+        t = np.linspace(0, 0.14, 8)
+        x = np.sin(t * 10).reshape(-1, 1)
+        f.update_chunk(t, x)
+        out = f.get_output(0.07)
+        assert out is not None
+        # Just verify it returns something reasonable
+        assert np.isfinite(out).all()
+
+
+class TestAsyncFilterRTCTiming:
+    """Tests for inference timing / delay auto-recording."""
+
+    def _make_filter(self, **kwargs):
+        return AsyncFilter(method="rtc", prediction_horizon=10, dt=0.02,
+                           initial_delay=0, **kwargs)
+
+    def test_auto_delay_recording(self):
+        f = self._make_filter()
+        t1 = np.linspace(0, 0.18, 10)
+        x1 = np.zeros((10, 2))
+        f.update_chunk(t1, x1)
+
+        # Simulate inference cycle
+        f.set_current_time(0.10)
+        f.start_inference()
+        f.set_current_time(0.16)  # 0.06s later → 3 steps at dt=0.02
+        t2 = np.linspace(0.10, 0.28, 10)
+        x2 = np.ones((10, 2))
+        f.update_chunk(t2, x2)
+
+        # Delay should have been recorded as ~3
+        assert f.delay_estimate == 3
+
+    def test_set_current_time(self):
+        f = self._make_filter()
+        f.set_current_time(1.5)
+        # No crash, and the time should be stored
+        assert f._current_time == 1.5
+
+
+class TestAsyncFilterRTCChunkSwitch:
+    """Tests for chunk switching behaviour."""
+
+    def _make_filter(self, **kwargs):
+        defaults = dict(prediction_horizon=10, dt=0.02, blend_mode="none")
+        defaults.update(kwargs)
+        return AsyncFilter(method="rtc", **defaults)
+
+    def test_prev_chunk_stored(self):
+        f = self._make_filter()
+        t1 = np.linspace(0, 0.18, 10)
+        x1 = np.zeros((10, 2))
+        t2 = np.linspace(0.10, 0.28, 10)
+        x2 = np.ones((10, 2))
+        f.update_chunk(t1, x1)
+        f.update_chunk(t2, x2)
+        assert f._prev_chunk_t is not None
+        np.testing.assert_allclose(f._prev_chunk_t, t1)
+
+    def test_current_chunk_property(self):
+        f = self._make_filter()
+        t, x = np.linspace(0, 0.18, 10), np.zeros((10, 2))
+        f.update_chunk(t, x)
+        chunk = f.current_chunk
+        assert chunk is not None
+        np.testing.assert_allclose(chunk[0], t)
+        np.testing.assert_allclose(chunk[1], x)
+
+    def test_current_chunk_is_copy(self):
+        """current_chunk should return a copy, not a reference."""
+        f = self._make_filter()
+        t, x = np.linspace(0, 0.18, 10), np.zeros((10, 2))
+        f.update_chunk(t, x)
+        chunk = f.current_chunk
+        chunk[1][:] = 999
+        chunk2 = f.current_chunk
+        assert not np.any(chunk2[1] == 999)
+
+    def test_multiple_chunk_updates(self):
+        f = self._make_filter()
+        for i in range(5):
+            start = i * 0.1
+            t = np.linspace(start, start + 0.18, 10)
+            x = np.full((10, 2), float(i))
+            f.update_chunk(t, x)
+        out = f.get_output()
+        np.testing.assert_allclose(out, [4.0, 4.0], atol=1e-12)
+
+
+class TestAsyncFilterRTCThreadSafety:
+    """Thread safety of AsyncFilterRTC."""
+
+    def test_concurrent_update_and_query(self):
+        f = AsyncFilter(method="rtc", prediction_horizon=10, dt=0.02)
+        errors = []
+
+        def producer():
+            try:
+                for i in range(50):
+                    t = np.linspace(i * 0.1, i * 0.1 + 0.18, 10)
+                    x = np.full((10, 2), float(i))
+                    f.update_chunk(t, x)
+            except Exception as e:
+                errors.append(e)
+
+        def consumer():
+            try:
+                for _ in range(200):
+                    out = f.get_output()
+                    _ = f.get_prefix()
+                    _ = f.get_soft_mask()
+                    _ = f.delay_estimate
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=producer),
+            threading.Thread(target=consumer),
+            threading.Thread(target=consumer),
+        ]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=10)
+        assert not errors, f"Thread errors: {errors}"
+
+
+# ---------------------------------------------------------------------------
+# RTC – Inpainting
+# ---------------------------------------------------------------------------
+
+class TestAsyncFilterRTCInpaintingHard:
+    """Tests for hard (prefix replacement) inpainting."""
+
+    def _make_filter(self, **kwargs):
+        defaults = dict(
+            prediction_horizon=10, dt=0.02, min_execution_horizon=1,
+            initial_delay=2, inpainting="hard", blend_mode="none",
+        )
+        defaults.update(kwargs)
+        return AsyncFilterRTC(**defaults)
+
+    def test_first_chunk_no_inpainting(self):
+        """First chunk should never be modified (no previous to compare)."""
+        f = self._make_filter()
+        t = np.arange(10) * 0.02
+        x = np.arange(10, dtype=float).reshape(-1, 1) * 10.0
+        f.update_chunk(t, x)
+        for i, ti in enumerate(t):
+            out = f.get_output(t=ti)
+            np.testing.assert_allclose(out, x[i].ravel(), atol=1e-10)
+
+    def test_prefix_replaced_by_previous_chunk(self):
+        """Hard inpainting must replace the first d overlapping actions."""
+        f = self._make_filter(initial_delay=3)
+        dt = 0.02
+        H = 10
+        t1 = np.arange(H) * dt
+        x1 = np.ones((H, 2)) * 100.0
+        f.update_chunk(t1, x1)
+
+        t2 = np.arange(H) * dt
+        x2 = np.ones((H, 2)) * 200.0
+        f.update_chunk(t2, x2)
+
+        t3 = np.arange(H) * dt
+        x3 = np.ones((H, 2)) * 300.0
+        f.update_chunk(t3, x3)
+
+        # Delay=3, so first 3 overlapping actions should be from chunk2 (200)
+        for i in range(3):
+            out = f.get_output(t=t3[i])
+            np.testing.assert_allclose(out, [200.0, 200.0], atol=1e-10,
+                                       err_msg=f"index {i} should be from prev chunk")
+
+        # Actions beyond the prefix should be from the new chunk (300)
+        for i in range(4, H):
+            out = f.get_output(t=t3[i])
+            np.testing.assert_allclose(out, [300.0, 300.0], atol=1e-10,
+                                       err_msg=f"index {i} should be from new chunk")
+
+    def test_non_overlapping_chunks_skip_inpainting(self):
+        """If chunks don't overlap, inpainting should be skipped."""
+        f = self._make_filter(initial_delay=2)
+        dt = 0.02
+        H = 10
+        t1 = np.arange(H) * dt
+        x1 = np.ones((H, 1)) * 10.0
+        f.update_chunk(t1, x1)
+
+        t2 = np.arange(H) * dt + 0.5
+        x2 = np.ones((H, 1)) * 20.0
+        f.update_chunk(t2, x2)
+
+        t3 = np.arange(H) * dt + 1.0
+        x3 = np.ones((H, 1)) * 30.0
+        f.update_chunk(t3, x3)
+
+        for i in range(H):
+            out = f.get_output(t=t3[i])
+            np.testing.assert_allclose(out, [30.0], atol=1e-10)
+
+
+class TestAsyncFilterRTCInpaintingSoftMask:
+    """Tests for soft mask inpainting."""
+
+    def _make_filter(self, **kwargs):
+        defaults = dict(
+            prediction_horizon=10, dt=0.02, min_execution_horizon=2,
+            initial_delay=2, inpainting="soft_mask", blend_mode="none",
+        )
+        defaults.update(kwargs)
+        return AsyncFilterRTC(**defaults)
+
+    def test_prefix_fully_frozen(self):
+        """First d actions should use 100% of the previous chunk (W=1)."""
+        f = self._make_filter(initial_delay=2)
+        dt = 0.02
+        H = 10
+        t1 = np.arange(H) * dt
+        x1 = np.ones((H, 1)) * 100.0
+        f.update_chunk(t1, x1)
+        t2 = np.arange(H) * dt
+        x2 = np.ones((H, 1)) * 200.0
+        f.update_chunk(t2, x2)
+        t3 = np.arange(H) * dt
+        x3 = np.ones((H, 1)) * 300.0
+        f.update_chunk(t3, x3)
+
+        for i in range(2):
+            out = f.get_output(t=t3[i])
+            np.testing.assert_allclose(out, [200.0], atol=1e-10,
+                                       err_msg=f"index {i}: frozen prefix")
+
+    def test_free_region_untouched(self):
+        """Actions in the free region (i >= H-s) should be from new chunk."""
+        f = self._make_filter(initial_delay=2, min_execution_horizon=2)
+        dt = 0.02
+        H = 10
+        t1 = np.arange(H) * dt
+        x1 = np.ones((H, 1)) * 100.0
+        f.update_chunk(t1, x1)
+        t2 = np.arange(H) * dt
+        x2 = np.ones((H, 1)) * 200.0
+        f.update_chunk(t2, x2)
+        t3 = np.arange(H) * dt
+        x3 = np.ones((H, 1)) * 300.0
+        f.update_chunk(t3, x3)
+
+        for i in range(8, H):
+            out = f.get_output(t=t3[i])
+            np.testing.assert_allclose(out, [300.0], atol=1e-10,
+                                       err_msg=f"index {i}: free region")
+
+    def test_intermediate_is_blend(self):
+        """Actions between prefix and free region should be a blend."""
+        f = self._make_filter(initial_delay=2, min_execution_horizon=2)
+        dt = 0.02
+        H = 10
+        t1 = np.arange(H) * dt
+        x1 = np.ones((H, 1)) * 0.0
+        f.update_chunk(t1, x1)
+        t2 = np.arange(H) * dt
+        x2 = np.ones((H, 1)) * 0.0
+        f.update_chunk(t2, x2)
+        t3 = np.arange(H) * dt
+        x3 = np.ones((H, 1)) * 100.0
+        f.update_chunk(t3, x3)
+
+        for i in range(3, 7):
+            out = f.get_output(t=t3[i])
+            assert 0.0 <= out[0] <= 100.0, \
+                f"index {i}: expected blend, got {out[0]}"
+
+
+class TestAsyncFilterRTCInpaintingHermite:
+    """Tests for Hermite (C¹) inpainting."""
+
+    def _make_filter(self, **kwargs):
+        defaults = dict(
+            prediction_horizon=10, dt=0.02, min_execution_horizon=1,
+            initial_delay=2, inpainting="hermite",
+            inpainting_transition=4, blend_mode="none",
+        )
+        defaults.update(kwargs)
+        return AsyncFilterRTC(**defaults)
+
+    def test_prefix_replaced(self):
+        """First d actions should match the previous chunk exactly."""
+        f = self._make_filter(initial_delay=2)
+        dt = 0.02
+        H = 10
+        t1 = np.arange(H) * dt
+        x1 = np.ones((H, 1)) * 50.0
+        f.update_chunk(t1, x1)
+        t2 = np.arange(H) * dt
+        x2 = np.ones((H, 1)) * 100.0
+        f.update_chunk(t2, x2)
+        t3 = np.arange(H) * dt
+        x3 = np.ones((H, 1)) * 200.0
+        f.update_chunk(t3, x3)
+
+        for i in range(2):
+            out = f.get_output(t=t3[i])
+            np.testing.assert_allclose(out, [100.0], atol=1e-10,
+                                       err_msg=f"index {i}: prefix must match prev")
+
+    def test_transition_smoothness(self):
+        """Transition region should smoothly connect prefix to free region."""
+        f = self._make_filter(initial_delay=2, inpainting_transition=4)
+        dt = 0.02
+        H = 10
+        t1 = np.arange(H) * dt
+        x1 = np.ones((H, 1)) * 0.0
+        f.update_chunk(t1, x1)
+        t2 = np.arange(H) * dt
+        x2 = np.ones((H, 1)) * 0.0
+        f.update_chunk(t2, x2)
+        t3 = np.arange(H) * dt
+        x3 = np.ones((H, 1)) * 100.0
+        f.update_chunk(t3, x3)
+
+        vals = []
+        for i in range(H):
+            out = f.get_output(t=t3[i])
+            vals.append(out[0])
+
+        # Prefix should be 0
+        assert vals[0] == pytest.approx(0.0, abs=1e-10)
+        assert vals[1] == pytest.approx(0.0, abs=1e-10)
+
+        # After transition should be 100
+        for i in range(7, H):
+            assert vals[i] == pytest.approx(100.0, abs=1e-10), \
+                f"index {i}: expected 100, got {vals[i]}"
+
+    def test_c1_continuity_at_boundary(self):
+        """Velocity should be approximately continuous at prefix boundary."""
+        f = self._make_filter(initial_delay=3, inpainting_transition=4)
+        dt = 0.02
+        H = 10
+        t1 = np.arange(H) * dt
+        x1 = (np.arange(H) * 5.0).reshape(-1, 1)
+        f.update_chunk(t1, x1)
+        t2 = np.arange(H) * dt
+        x2 = (np.arange(H) * 5.0).reshape(-1, 1)
+        f.update_chunk(t2, x2)
+        t3 = np.arange(H) * dt
+        x3 = (np.arange(H) * 5.0 + 50.0).reshape(-1, 1)
+        f.update_chunk(t3, x3)
+
+        vals = [f.get_output(t=t3[i])[0] for i in range(H)]
+
+        v_before = (vals[2] - vals[1]) / dt
+        v_after = (vals[4] - vals[3]) / dt
+        assert abs(v_before - v_after) < 5000, \
+            f"Velocity jump too large: {v_before} vs {v_after}"
+
+
+class TestAsyncFilterRTCInpaintingFactory:
+    """Test that inpainting can be configured through the factory."""
+
+    def test_factory_inpainting_param(self):
+        f = AsyncFilter(
+            method="rtc", prediction_horizon=10, dt=0.02,
+            inpainting="hard",
+        )
+        assert f._inpainting == "hard"
+
+    def test_factory_hermite_inpainting(self):
+        f = AsyncFilter(
+            method="rtc", prediction_horizon=10, dt=0.02,
+            inpainting="hermite", inpainting_transition=3,
+        )
+        assert f._inpainting == "hermite"
+        assert f._inpainting_transition == 3
+
+    def test_invalid_inpainting_raises(self):
+        with pytest.raises(ValueError, match="Unknown inpainting"):
+            AsyncFilterRTC(
+                prediction_horizon=10, dt=0.02,
+                inpainting="invalid_mode",
+            )
+
+
+# ---------------------------------------------------------------------------
+# RTC – Callback Inpainting
+# ---------------------------------------------------------------------------
+
+class TestAsyncFilterRTCInpaintingCallback:
+    """Tests for callback-based inpainting."""
+
+    def test_callback_requires_fn(self):
+        with pytest.raises(ValueError, match="inpainting_fn must be provided"):
+            AsyncFilterRTC(
+                prediction_horizon=10, dt=0.02,
+                inpainting="callback",
+            )
+
+    def test_callback_basic(self):
+        """Callback should be invoked and its return value used."""
+        call_log = []
+
+        def my_inpaint(x_new, x_old_interp, t_new, t_old, mask, delay):
+            call_log.append({
+                "x_new_shape": x_new.shape,
+                "mask_shape": mask.shape,
+                "delay": delay,
+            })
+            # Return all zeros
+            return np.zeros_like(x_new)
+
+        f = AsyncFilterRTC(
+            prediction_horizon=10, dt=0.02, initial_delay=2,
+            inpainting="callback", inpainting_fn=my_inpaint,
+            blend_mode="none",
+        )
+        dt = 0.02
+        H = 10
+        t1 = np.arange(H) * dt
+        x1 = np.ones((H, 2)) * 100.0
+        f.update_chunk(t1, x1)  # no prev → no callback
+
+        t2 = np.arange(H) * dt
+        x2 = np.ones((H, 2)) * 200.0
+        f.update_chunk(t2, x2)  # prev=None, curr=chunk1 → no callback
+
+        t3 = np.arange(H) * dt
+        x3 = np.ones((H, 2)) * 300.0
+        f.update_chunk(t3, x3)  # prev=chunk1, curr=chunk2 → callback called
+
+        assert len(call_log) == 1
+        assert call_log[0]["x_new_shape"] == (10, 2)
+        assert call_log[0]["mask_shape"] == (10,)
+        assert call_log[0]["delay"] >= 0
+
+        # Output should reflect the callback (zeros)
+        out = f.get_output(t=t3[0])
+        np.testing.assert_allclose(out, [0.0, 0.0], atol=1e-10)
+
+    def test_callback_receives_correct_data(self):
+        """Verify the callback receives correct old-chunk interpolation."""
+        received = {}
+
+        def capture_inpaint(x_new, x_old_interp, t_new, t_old, mask, delay):
+            received["x_old_interp"] = x_old_interp.copy()
+            received["t_new"] = t_new.copy()
+            received["mask"] = mask.copy()
+            return x_new  # passthrough
+
+        f = AsyncFilterRTC(
+            prediction_horizon=10, dt=0.02, initial_delay=2,
+            inpainting="callback", inpainting_fn=capture_inpaint,
+            blend_mode="none",
+        )
+        dt = 0.02
+        H = 10
+        # chunk1: linearly increasing
+        t1 = np.arange(H) * dt
+        x1 = (np.arange(H, dtype=float) * 10).reshape(-1, 1)
+        f.update_chunk(t1, x1)
+        # chunk2: constant 50
+        t2 = np.arange(H) * dt
+        x2 = np.ones((H, 1)) * 50.0
+        f.update_chunk(t2, x2)
+        # chunk3: triggers callback against chunk2
+        t3 = np.arange(H) * dt
+        x3 = np.ones((H, 1)) * 999.0
+        f.update_chunk(t3, x3)
+
+        # x_old_interp should be chunk2 values (50.0)
+        np.testing.assert_allclose(received["x_old_interp"], 50.0, atol=1e-10)
+        assert received["mask"].shape == (H,)
+
+    def test_callback_via_factory(self):
+        """Factory should forward inpainting_fn."""
+        def noop(x_new, x_old_interp, t_new, t_old, mask, delay):
+            return x_new
+
+        f = AsyncFilter(
+            method="rtc", prediction_horizon=10, dt=0.02,
+            inpainting="callback", inpainting_fn=noop,
+        )
+        assert f._inpainting == "callback"
+        assert f._inpainting_fn is noop
+
+
+# ---------------------------------------------------------------------------
+# RTC + RAIL composite
+# ---------------------------------------------------------------------------
+
+class TestAsyncFilterRTCRAILBasic:
+    """Basic functionality of the RTC+RAIL composite filter."""
+
+    H = 16
+    DT = 0.02
+
+    def _make_filter(self, **kwargs):
+        defaults = dict(
+            prediction_horizon=self.H,
+            dt=self.DT,
+            min_execution_horizon=4,
+            inpainting="none",
+            poly_degree=3,
+            blend_order="quintic",
+        )
+        defaults.update(kwargs)
+        return AsyncFilterRTCRAIL(**defaults)
+
+    def _make_chunk(self, t_start, dim=3, slope=1.0):
+        t = t_start + np.arange(self.H) * self.DT
+        x = np.column_stack([slope * (t - t_start) + d for d in range(dim)])
+        return t, x
+
+    def test_none_before_any_chunk(self):
+        f = self._make_filter()
+        assert f.get_output(0.0) is None
+
+    def test_output_after_one_chunk(self):
+        f = self._make_filter()
+        t, x = self._make_chunk(0.0)
+        f.update_chunk(t, x)
+        out = f.get_output(0.1)
+        assert out is not None
+        assert out.shape == (3,)
+
+    def test_output_shape_1d(self):
+        f = self._make_filter()
+        t = np.arange(self.H) * self.DT
+        x = np.sin(t)
+        f.update_chunk(t, x)
+        out = f.get_output(0.05)
+        assert out is not None
+        assert out.shape == (1,)
+
+    def test_factory_registration(self):
+        f = AsyncFilter(
+            method="rtc_rail",
+            prediction_horizon=self.H,
+            dt=self.DT,
+        )
+        assert isinstance(f, AsyncFilterRTCRAIL)
+
+    def test_is_rtc_subclass(self):
+        f = self._make_filter()
+        assert isinstance(f, AsyncFilterRTC)
+
+    def test_prefix_available(self):
+        f = self._make_filter()
+        t, x = self._make_chunk(0.0)
+        f.set_current_time(0.1)
+        f.update_chunk(t, x)
+        prefix = f.get_prefix()
+        assert prefix is not None
+        t_p, x_p, delay = prefix
+        assert t_p.ndim == 1
+        assert x_p.ndim == 2
+
+    def test_delay_estimate(self):
+        f = self._make_filter(initial_delay=3)
+        assert f.delay_estimate == 3
+
+
+class TestAsyncFilterRTCRAILSmoothing:
+    """Verify RAIL smoothing is applied to RTC output."""
+
+    H = 20
+    DT = 0.02
+
+    def _make_filter(self, **kwargs):
+        defaults = dict(
+            prediction_horizon=self.H,
+            dt=self.DT,
+            min_execution_horizon=4,
+            poly_degree=3,
+            blend_order="quintic",
+        )
+        defaults.update(kwargs)
+        return AsyncFilterRTCRAIL(**defaults)
+
+    def test_noisy_chunk_smoothed(self):
+        """Polynomial fitting should reduce noise compared to raw RTC."""
+        rng = np.random.default_rng(42)
+        t = np.arange(self.H) * self.DT
+        clean = np.column_stack([t, t**2, np.sin(t)])
+        noisy = clean + rng.normal(0, 0.05, clean.shape)
+
+        rtc = AsyncFilterRTC(
+            prediction_horizon=self.H, dt=self.DT,
+            min_execution_horizon=4,
+        )
+        composite = self._make_filter()
+
+        rtc.update_chunk(t, noisy)
+        composite.update_chunk(t, noisy)
+
+        # Compare outputs at multiple points
+        query_times = t[2:-2]
+        rtc_outs = np.array([rtc.get_output(ti) for ti in query_times])
+        comp_outs = np.array([composite.get_output(ti) for ti in query_times])
+        clean_ref = np.array([
+            np.array([ti, ti**2, np.sin(ti)]) for ti in query_times
+        ])
+
+        rmse_rtc = np.sqrt(np.mean((rtc_outs - clean_ref) ** 2))
+        rmse_comp = np.sqrt(np.mean((comp_outs - clean_ref) ** 2))
+        # Composite (poly fit) should be closer to the clean signal
+        assert rmse_comp < rmse_rtc
+
+    def test_two_chunks_blended(self):
+        """Output should be smooth across chunk boundary (RAIL blending)."""
+        t1 = np.arange(self.H) * self.DT
+        x1 = np.column_stack([t1, t1**2])
+
+        t2 = t1 + 0.16  # overlap
+        x2 = np.column_stack([t2 + 0.01, t2**2 + 0.01])  # slight offset
+
+        f = self._make_filter()
+        f.set_current_time(0.0)
+        f.update_chunk(t1, x1)
+        f.set_current_time(0.16)
+        f.update_chunk(t2, x2)
+
+        # Query across the boundary
+        ts = np.linspace(0.1, 0.3, 50)
+        outs = [f.get_output(ti) for ti in ts]
+        assert all(o is not None for o in outs)
+        outs = np.array(outs)
+
+        # Check smoothness: finite-difference acceleration should be bounded
+        vel = np.diff(outs, axis=0) / np.diff(ts)[:, None]
+        acc = np.diff(vel, axis=0) / np.diff(ts[:-1])[:, None]
+        # No wild jumps
+        assert np.all(np.abs(acc) < 500)
+
+
+class TestAsyncFilterRTCRAILInpainting:
+    """Verify RTC inpainting is applied before RAIL processing."""
+
+    H = 16
+    DT = 0.02
+
+    def _make_filter(self, **kwargs):
+        defaults = dict(
+            prediction_horizon=self.H,
+            dt=self.DT,
+            min_execution_horizon=4,
+            inpainting="hard",
+            poly_degree=3,
+        )
+        defaults.update(kwargs)
+        return AsyncFilterRTCRAIL(**defaults)
+
+    def test_hard_inpainting_applied(self):
+        """Chunk values should be modified by inpainting on third chunk."""
+        f = self._make_filter()
+        t1 = np.arange(self.H) * self.DT
+        x1 = np.ones((self.H, 2)) * 10.0
+
+        f.set_current_time(0.0)
+        f.update_chunk(t1, x1)
+
+        # Second chunk — sets prev_chunk so inpainting can trigger on third
+        t2 = t1 + self.H * self.DT * 0.5
+        x2 = np.ones((self.H, 2)) * 15.0
+        f.set_current_time(self.H * self.DT * 0.5)
+        f.update_chunk(t2, x2)
+
+        # Third chunk — inpainting should replace prefix with chunk2 values
+        t3 = t2 + self.H * self.DT * 0.5
+        x3 = np.ones((self.H, 2)) * 30.0
+        f.set_current_time(self.H * self.DT)
+        f.update_chunk(t3, x3)
+
+        # The stored current chunk should have inpainted prefix
+        with f._lock:
+            stored = f._curr_chunk_x
+        assert not np.allclose(stored, 30.0)
+
+    def test_hermite_inpainting_with_rail(self):
+        """Hermite inpainting + RAIL should produce C¹-continuous output."""
+        f = self._make_filter(inpainting="hermite")
+        t1 = np.arange(self.H) * self.DT
+        x1 = np.column_stack([np.sin(t1)])
+
+        f.set_current_time(0.0)
+        f.update_chunk(t1, x1)
+
+        t2 = t1 + 8 * self.DT
+        x2 = np.column_stack([np.sin(t2) + 0.1])
+
+        f.set_current_time(8 * self.DT)
+        f.update_chunk(t2, x2)
+
+        # Query around the boundary
+        ts = np.linspace(0.05, 0.25, 40)
+        outs = np.array([f.get_output(ti) for ti in ts])
+        assert outs.shape == (40, 1)
+
+        # Velocity (finite diff) should be reasonably smooth
+        vel = np.diff(outs[:, 0]) / np.diff(ts)
+        max_vel_jump = np.max(np.abs(np.diff(vel)))
+        assert max_vel_jump < 100  # no discontinuity
+
+
+class TestAsyncFilterRTCRAILTimePropagation:
+    """Verify set_current_time propagates to both stages."""
+
+    def test_current_time_propagated_to_rail(self):
+        f = AsyncFilterRTCRAIL(
+            prediction_horizon=10, dt=0.02,
+        )
+        f.set_current_time(1.5)
+        assert f._rail._current_time == 1.5
+
+    def test_start_inference_records_delay(self):
+        f = AsyncFilterRTCRAIL(
+            prediction_horizon=10, dt=0.02,
+        )
+        f.set_current_time(0.0)
+        f.start_inference()
+        f.set_current_time(0.1)
+
+        t = np.arange(10) * 0.02
+        x = np.ones((10, 2))
+        f.update_chunk(t, x)
+        assert f.delay_estimate >= 1
+
+
+class TestAsyncFilterRTCRAILPrefix:
+    """Verify get_prefix returns RAIL-smoothed values."""
+
+    H = 16
+    DT = 0.02
+
+    def _make_filter(self, **kwargs):
+        defaults = dict(
+            prediction_horizon=self.H,
+            dt=self.DT,
+            min_execution_horizon=4,
+            poly_degree=3,
+            blend_order="quintic",
+        )
+        defaults.update(kwargs)
+        return AsyncFilterRTCRAIL(**defaults)
+
+    def test_prefix_returns_rail_smoothed_values(self):
+        """Prefix values should differ from raw chunk (poly-smoothed)."""
+        rng = np.random.default_rng(42)
+        f = self._make_filter(initial_delay=3)
+
+        t = np.arange(self.H) * self.DT
+        clean = np.column_stack([t, t ** 2])
+        noisy = clean + rng.normal(0, 0.1, clean.shape)
+
+        f.set_current_time(0.0)
+        f.update_chunk(t, noisy)
+
+        prefix = f.get_prefix()
+        assert prefix is not None
+        t_p, x_p, delay = prefix
+
+        # Prefix values should come from RAIL polynomial, not raw noisy chunk
+        # Verify by comparing against raw chunk slice
+        with f._lock:
+            s = max(delay, f._s_min)
+            ps = min(s, len(f._curr_chunk_t))
+            pe = min(s + delay, len(f._curr_chunk_t))
+            raw_prefix = f._curr_chunk_x[ps:pe].copy()
+
+        # RAIL polynomial fit smooths noise — values should differ
+        assert not np.allclose(x_p, raw_prefix, atol=1e-10)
+
+    def test_prefix_closer_to_clean_signal(self):
+        """RAIL-smoothed prefix should be closer to truth than raw prefix."""
+        rng = np.random.default_rng(123)
+        f_composite = self._make_filter(initial_delay=3)
+        f_rtc = AsyncFilterRTC(
+            prediction_horizon=self.H, dt=self.DT,
+            min_execution_horizon=4, initial_delay=3,
+        )
+
+        t = np.arange(self.H) * self.DT
+        clean = np.column_stack([np.sin(t), np.cos(t)])
+        noisy = clean + rng.normal(0, 0.15, clean.shape)
+
+        f_composite.set_current_time(0.0)
+        f_composite.update_chunk(t, noisy)
+        f_rtc.set_current_time(0.0)
+        f_rtc.update_chunk(t, noisy)
+
+        prefix_comp = f_composite.get_prefix()
+        prefix_rtc = f_rtc.get_prefix()
+        assert prefix_comp is not None and prefix_rtc is not None
+
+        t_p = prefix_comp[0]
+        gt = np.column_stack([np.sin(t_p), np.cos(t_p)])
+
+        rmse_comp = np.sqrt(np.mean((prefix_comp[1] - gt) ** 2))
+        rmse_rtc = np.sqrt(np.mean((prefix_rtc[1] - gt) ** 2))
+        assert rmse_comp < rmse_rtc
+
+    def test_prefix_shape_and_delay(self):
+        """Prefix should have correct shape and delay value."""
+        f = self._make_filter(initial_delay=2)
+        t = np.arange(self.H) * self.DT
+        x = np.ones((self.H, 3)) * 5.0
+
+        f.set_current_time(0.0)
+        f.update_chunk(t, x)
+
+        prefix = f.get_prefix()
+        assert prefix is not None
+        t_p, x_p, delay = prefix
+        assert t_p.ndim == 1
+        assert x_p.ndim == 2
+        assert x_p.shape[1] == 3
+        assert t_p.shape[0] == x_p.shape[0]
+        assert delay >= 1
+
+    def test_prefix_none_before_chunk(self):
+        """get_prefix should return None before any chunk."""
+        f = self._make_filter()
+        assert f.get_prefix() is None
+
+    def test_prefix_matches_get_output(self):
+        """Prefix values should match get_output at same timestamps."""
+        f = self._make_filter(initial_delay=2)
+        t = np.arange(self.H) * self.DT
+        x = np.column_stack([np.sin(t), np.cos(t), t])
+
+        f.set_current_time(0.0)
+        f.update_chunk(t, x)
+
+        prefix = f.get_prefix()
+        assert prefix is not None
+        t_p, x_p, _ = prefix
+
+        for i, ti in enumerate(t_p):
+            out = f.get_output(float(ti))
+            assert out is not None
+            np.testing.assert_allclose(x_p[i], out, atol=1e-12)
+
+
+class TestAsyncFilterRTCRAILThreadSafety:
+    """Concurrent access should not crash."""
+
+    def test_concurrent_update_and_query(self):
+        f = AsyncFilterRTCRAIL(
+            prediction_horizon=16, dt=0.02,
+            min_execution_horizon=4, poly_degree=3,
+        )
+        errors = []
+
+        def writer():
+            try:
+                rng = np.random.default_rng(0)
+                for i in range(20):
+                    t = np.arange(16) * 0.02 + i * 0.1
+                    x = rng.standard_normal((16, 3))
+                    f.set_current_time(i * 0.1)
+                    f.update_chunk(t, x)
+            except Exception as e:
+                errors.append(e)
+
+        def reader():
+            try:
+                for i in range(100):
+                    f.get_output(i * 0.02)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=writer),
+            threading.Thread(target=reader),
+            threading.Thread(target=reader),
+        ]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=5)
+        assert not errors

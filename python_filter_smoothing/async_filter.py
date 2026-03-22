@@ -13,7 +13,7 @@ from __future__ import annotations
 import abc
 import threading
 from collections import deque
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 from scipy import interpolate as sp_interpolate
@@ -1482,6 +1482,1044 @@ class AsyncFilterRAIL(AsyncFilterBase):
         return np.zeros(self._dim)  # pragma: no cover
 
 
+# -- Real-Time Chunking (RTC) framework ------------------------------------
+
+
+class AsyncFilterRTC(AsyncFilterBase):
+    """Real-Time Chunking (RTC) asynchronous execution framework.
+
+    Manages the asynchronous lifecycle of action chunks as described in
+    Black et al. "Real-Time Execution of Action Chunking Flow Policies"
+    (NeurIPS 2025, arXiv:2506.07339) and the training-time variant from
+    Black et al. (arXiv:2512.05964).
+
+    The filter provides:
+
+    * **Prefix freezing** – :meth:`get_prefix` returns the frozen action
+      prefix and current delay estimate so the caller can condition its
+      model accordingly.
+    * **Soft mask computation** – :meth:`get_soft_mask` returns the
+      exponentially decaying mask vector :math:`\\mathbf{W}` (Eq. 5 of
+      arXiv:2506.07339) for inference-time inpainting guidance.
+    * **Action-space inpainting** – when *inpainting* is enabled, incoming
+      chunks are automatically modified in :meth:`update_chunk` to enforce
+      continuity with the frozen prefix from the previous chunk.  Three
+      methods are available:
+
+      * ``'hard'``      – replace the overlapping prefix with frozen
+        actions (training-time RTC style; arXiv:2512.05964).
+      * ``'soft_mask'`` – weighted blend with the previous chunk using the
+        RTC exponential-decay soft mask (Eq. 5; arXiv:2506.07339).
+      * ``'hermite'``   – replace prefix and apply a cubic Hermite
+        transition at the boundary to guarantee :math:`C^1` continuity
+        in position and velocity.
+      * ``'callback'``  – delegate to a user-supplied callable
+        (*inpainting_fn*), e.g. for ΠGDM-guided inpainting.
+    * **Delay estimation** – a running buffer of observed delays with
+      configurable aggregation (``max``, ``mean``, ``ema``).
+    * **Seamless chunk hand-off** – :meth:`update_chunk` swaps in a newly
+      generated chunk and updates internal bookkeeping; :meth:`get_output`
+      returns the appropriate action at query time with optional blending
+      across the chunk boundary.
+
+    Parameters
+    ----------
+    buffer_size : int, optional
+        Per-sample buffer capacity (default: ``100``).
+    prediction_horizon : int
+        :math:`H` – number of action steps in each chunk.
+    min_execution_horizon : int, optional
+        :math:`s_{\\min}` – minimum steps to execute before starting the
+        next inference (default: ``1``).
+    dt : float
+        Controller sampling period in seconds (:math:`\\Delta t`).
+    delay_buffer_size : int, optional
+        Number of past delays kept for estimation (default: ``5``).
+    initial_delay : int, optional
+        Seed value for the delay buffer before any real measurement
+        (default: ``1``).
+    delay_estimate_method : str, optional
+        How to aggregate past delays: ``'max'`` (default, conservative),
+        ``'mean'``, or ``'ema'`` (exponential moving average with
+        ``alpha = 0.3``).
+    inpainting : str, optional
+        Action-space inpainting applied when a new chunk is registered via
+        :meth:`update_chunk`:
+
+        * ``'none'``      – no inpainting; chunk is stored as-is (default).
+        * ``'hard'``      – replace the prefix region with frozen actions
+          from the previous chunk (training-time RTC, arXiv:2512.05964).
+        * ``'soft_mask'`` – blend with the previous chunk using the RTC
+          exponential-decay soft mask (Eq. 5, arXiv:2506.07339).
+        * ``'hermite'``   – replace prefix **and** apply a cubic Hermite
+          polynomial transition at the boundary for :math:`C^1` continuity.
+        * ``'callback'``  – delegate to a user-supplied callable via
+          *inpainting_fn* (e.g. for ΠGDM-guided inpainting).
+    inpainting_fn : callable, optional
+        Custom inpainting function, **required** when ``inpainting='callback'``.
+        Signature::
+
+            fn(x_new, x_old_interp, t_new, t_old, mask, delay)
+                -> np.ndarray  # shape (H, D)
+
+        where *x_new* is the raw new chunk ``(H, D)``, *x_old_interp* is the
+        previous chunk interpolated at *t_new* ``(H, D)``, *t_new* and *t_old*
+        are the timestamp arrays, *mask* is the soft mask ``(H,)``, and
+        *delay* is the estimated delay (int).
+    inpainting_transition : int, optional
+        Number of action steps used for the transition region in
+        ``'hermite'`` inpainting.  Ignored by other modes.  Defaults to
+        ``min(4, H // 4)``.
+    blend_mode : str, optional
+        How to handle the transition between the old and new chunk in
+        :meth:`get_output`:
+
+        * ``'none'``      – use the new chunk directly (user handles
+          continuity via inpainting).
+        * ``'soft_mask'``  – blend old and new chunk values using the
+          RTC soft mask weights (default).
+        * ``'linear'``     – linear cross-fade over the overlap region.
+    interpolation : str, optional
+        Temporal interpolation within a chunk: ``'linear'`` (default) or
+        ``'pchip'``.
+    extrapolation : str, optional
+        Behaviour when querying beyond the current chunk's time range:
+        ``'linear'`` (first-order hold, default) or ``'clamp'`` (zero-order
+        hold).
+    """
+
+    def __init__(
+        self,
+        buffer_size: int = 100,
+        prediction_horizon: int = 50,
+        min_execution_horizon: int = 1,
+        dt: float = 0.02,
+        delay_buffer_size: int = 5,
+        initial_delay: int = 1,
+        delay_estimate_method: str = "max",
+        inpainting: str = "none",
+        inpainting_fn: Optional[Callable] = None,
+        inpainting_transition: Optional[int] = None,
+        blend_mode: str = "soft_mask",
+        interpolation: str = "linear",
+        extrapolation: str = "linear",
+    ) -> None:
+        super().__init__(buffer_size=buffer_size)
+        if prediction_horizon < 2:
+            raise ValueError("prediction_horizon must be >= 2.")
+        if min_execution_horizon < 1:
+            raise ValueError("min_execution_horizon must be >= 1.")
+        if dt <= 0.0:
+            raise ValueError("dt must be positive.")
+        if delay_estimate_method not in ("max", "mean", "ema"):
+            raise ValueError(
+                f"Unknown delay_estimate_method '{delay_estimate_method}'."
+            )
+        if inpainting not in ("none", "hard", "soft_mask", "hermite", "callback"):
+            raise ValueError(f"Unknown inpainting '{inpainting}'.")
+        if inpainting == "callback" and inpainting_fn is None:
+            raise ValueError(
+                "inpainting_fn must be provided when inpainting='callback'."
+            )
+        if blend_mode not in ("none", "soft_mask", "linear"):
+            raise ValueError(f"Unknown blend_mode '{blend_mode}'.")
+        if interpolation not in ("linear", "pchip"):
+            raise ValueError(f"Unknown interpolation '{interpolation}'.")
+        if extrapolation not in ("linear", "clamp"):
+            raise ValueError(f"Unknown extrapolation '{extrapolation}'.")
+
+        self._H = int(prediction_horizon)
+        self._s_min = int(min_execution_horizon)
+        self._dt = float(dt)
+        self._inpainting = inpainting
+        self._inpainting_fn = inpainting_fn
+        self._inpainting_transition = (
+            int(inpainting_transition)
+            if inpainting_transition is not None
+            else min(4, self._H // 4)
+        )
+        self._blend_mode = blend_mode
+        self._interpolation = interpolation
+        self._extrapolation = extrapolation
+        self._delay_est_method = delay_estimate_method
+
+        # Delay estimation buffer
+        self._delay_buf: deque[int] = deque(
+            [max(0, int(initial_delay))], maxlen=max(1, int(delay_buffer_size))
+        )
+
+        # Chunk state
+        self._curr_chunk_t: Optional[np.ndarray] = None
+        self._curr_chunk_x: Optional[np.ndarray] = None
+        self._prev_chunk_t: Optional[np.ndarray] = None
+        self._prev_chunk_x: Optional[np.ndarray] = None
+
+        # Timing bookkeeping
+        self._chunk_switch_time: Optional[float] = None
+        self._current_time: Optional[float] = None
+        self._inference_start_time: Optional[float] = None
+
+    # ------------------------------------------------------------------
+    # Delay estimation
+    # ------------------------------------------------------------------
+
+    @property
+    def delay_estimate(self) -> int:
+        """Current estimated delay in controller timesteps (thread-safe)."""
+        with self._lock:
+            return self._estimate_delay()
+
+    def _estimate_delay(self) -> int:
+        """Aggregate the delay buffer (call inside lock)."""
+        if not self._delay_buf:
+            return 1
+        if self._delay_est_method == "max":
+            return int(max(self._delay_buf))
+        if self._delay_est_method == "mean":
+            return int(round(sum(self._delay_buf) / len(self._delay_buf)))
+        # ema
+        alpha = 0.3
+        val = float(self._delay_buf[0])
+        for d in list(self._delay_buf)[1:]:
+            val = alpha * d + (1 - alpha) * val
+        return max(1, int(round(val)))
+
+    def record_delay(self, delay: int) -> None:
+        """Record an observed inference delay (thread-safe).
+
+        Parameters
+        ----------
+        delay : int
+            Observed delay in controller timesteps.
+        """
+        with self._lock:
+            self._delay_buf.append(max(0, int(delay)))
+
+    # ------------------------------------------------------------------
+    # Execution horizon
+    # ------------------------------------------------------------------
+
+    @property
+    def execution_horizon(self) -> int:
+        """Current execution horizon ``max(d, s_min)`` (thread-safe)."""
+        with self._lock:
+            return max(self._estimate_delay(), self._s_min)
+
+    # ------------------------------------------------------------------
+    # Current chunk accessor
+    # ------------------------------------------------------------------
+
+    @property
+    def current_chunk(self) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        """Currently active ``(t, x)`` chunk, or ``None`` (thread-safe)."""
+        with self._lock:
+            if self._curr_chunk_t is None:
+                return None
+            return (self._curr_chunk_t.copy(), self._curr_chunk_x.copy())
+
+    # ------------------------------------------------------------------
+    # Soft mask
+    # ------------------------------------------------------------------
+
+    def get_soft_mask(self, delay: Optional[int] = None) -> np.ndarray:
+        r"""Compute the soft mask :math:`\mathbf{W}` (Eq. 5 of arXiv:2506.07339).
+
+        Parameters
+        ----------
+        delay : int, optional
+            Override delay value.  If ``None``, uses the current estimate.
+
+        Returns
+        -------
+        np.ndarray, shape (H,)
+            Mask vector with values in ``[0, 1]``.
+        """
+        with self._lock:
+            d = delay if delay is not None else self._estimate_delay()
+        return self._compute_soft_mask(d, max(d, self._s_min))
+
+    def _compute_soft_mask(self, d: int, s: int) -> np.ndarray:
+        """Compute soft mask (no lock needed, pure function)."""
+        H = self._H
+        d = max(0, min(d, H - 1))
+        s = max(1, min(s, H))
+        W = np.zeros(H)
+        denom = H - s - d + 1
+        for i in range(H):
+            if i < d:
+                W[i] = 1.0
+            elif i < H - s and denom > 0:
+                c = (H - s - i) / denom
+                W[i] = c * (np.exp(c) - 1.0) / (np.e - 1.0)
+            # else: 0.0
+        return W
+
+    # ------------------------------------------------------------------
+    # Prefix for next inference
+    # ------------------------------------------------------------------
+
+    def get_prefix(self) -> Optional[tuple[np.ndarray, np.ndarray, int]]:
+        """Return the frozen action prefix for the next chunk generation.
+
+        The prefix consists of the actions from the current chunk that will
+        have been executed by the time the next chunk becomes available.
+
+        Returns
+        -------
+        tuple of (t_prefix, x_prefix, delay) or None
+            ``t_prefix`` – shape ``(d,)`` timestamps.
+            ``x_prefix`` – shape ``(d, D)`` action values.
+            ``delay``    – estimated delay in controller timesteps.
+            Returns ``None`` if no chunk has been registered yet.
+        """
+        with self._lock:
+            if self._curr_chunk_t is None:
+                return None
+            d = self._estimate_delay()
+            s = max(d, self._s_min)
+            # Prefix = first d actions counting from where we'd start
+            # the next inference (after s steps have been executed).
+            t_c = self._curr_chunk_t
+            x_c = self._curr_chunk_x
+            # The overlap region starts at index s in the current chunk
+            prefix_start = min(s, len(t_c))
+            prefix_end = min(s + d, len(t_c))
+            if prefix_end <= prefix_start:
+                # Degenerate: return the last available action
+                return (
+                    t_c[-1:].copy(),
+                    x_c[-1:].copy(),
+                    d,
+                )
+            return (
+                t_c[prefix_start:prefix_end].copy(),
+                x_c[prefix_start:prefix_end].copy(),
+                d,
+            )
+
+    def start_inference(self) -> None:
+        """Mark the start of an inference call (thread-safe).
+
+        Call this right before starting model inference so that the
+        observed delay can later be computed automatically when
+        :meth:`update_chunk` is called.
+        """
+        with self._lock:
+            self._inference_start_time = self._current_time
+
+    # ------------------------------------------------------------------
+    # Chunk ingestion
+    # ------------------------------------------------------------------
+
+    def update_chunk(self, t, x) -> None:  # noqa: D401
+        """Register a newly generated action chunk (thread-safe).
+
+        The previous current chunk becomes the *previous* chunk, and the
+        supplied chunk becomes the *current* chunk.  If *inpainting* is
+        enabled and a previous chunk exists, the new chunk is modified
+        in-place before storage to enforce continuity with the frozen
+        prefix.
+
+        If :meth:`start_inference` was called beforehand, the observed
+        delay is automatically recorded.
+
+        Parameters
+        ----------
+        t : array-like, shape (H,)
+            Timestamps for each action in the chunk.
+        x : array-like, shape (H, D) or (H,)
+            Action values.
+        """
+        t_arr = np.asarray(t, dtype=float).ravel()
+        x_arr = np.asarray(x, dtype=float)
+        if x_arr.ndim == 1:
+            x_arr = x_arr.reshape(-1, 1)
+        if x_arr.shape[0] != len(t_arr):
+            raise ValueError(
+                f"t has {len(t_arr)} samples but x has {x_arr.shape[0]}."
+            )
+
+        with self._lock:
+            if self._dim is None:
+                self._dim = x_arr.shape[1]
+
+            # Apply inpainting if enabled and a previous chunk is available
+            if (
+                self._inpainting != "none"
+                and self._prev_chunk_t is not None
+                and self._curr_chunk_t is not None
+            ):
+                x_arr = self._apply_inpainting(
+                    t_arr, x_arr,
+                    self._curr_chunk_t, self._curr_chunk_x,
+                )
+
+            # Shift chunks
+            self._prev_chunk_t = self._curr_chunk_t
+            self._prev_chunk_x = self._curr_chunk_x
+            self._curr_chunk_t = t_arr.copy()
+            self._curr_chunk_x = x_arr.copy()
+            self._chunk_switch_time = self._current_time
+
+            # Auto-record delay
+            if (
+                self._inference_start_time is not None
+                and self._current_time is not None
+            ):
+                elapsed = self._current_time - self._inference_start_time
+                observed_delay = max(0, int(round(elapsed / self._dt)))
+                self._delay_buf.append(observed_delay)
+                self._inference_start_time = None
+
+            # Populate base buffer for compatibility
+            for ti, xi in zip(t_arr, x_arr):
+                self._t_buf.append(float(ti))
+                self._x_buf.append(xi.copy())
+
+    # ------------------------------------------------------------------
+    # Time management
+    # ------------------------------------------------------------------
+
+    def set_current_time(self, t: float) -> None:
+        """Inform the filter of the current controller time (thread-safe).
+
+        Call this every control cycle **before** :meth:`get_output`.
+
+        Parameters
+        ----------
+        t : float
+            Current time in seconds.
+        """
+        with self._lock:
+            self._current_time = float(t)
+
+    # ------------------------------------------------------------------
+    # Output
+    # ------------------------------------------------------------------
+
+    def get_output(self, t: Optional[float] = None) -> Optional[np.ndarray]:
+        """Return the action at time *t* from the current chunk (thread-safe).
+
+        If the query falls in the overlap region between the previous and
+        current chunk, the output is blended according to *blend_mode*.
+
+        Parameters
+        ----------
+        t : float, optional
+            Query time.  Defaults to the latest chunk timestamp.
+
+        Returns
+        -------
+        np.ndarray, shape (D,) or None
+        """
+        with self._lock:
+            if self._curr_chunk_t is None or self._dim is None:
+                return None
+
+            t_c = self._curr_chunk_t
+            x_c = self._curr_chunk_x
+            t_query = float(t) if t is not None else float(t_c[-1])
+
+            val_new = self._interp_chunk(t_c, x_c, t_query)
+
+            # Blending with previous chunk
+            if (
+                self._blend_mode != "none"
+                and self._prev_chunk_t is not None
+            ):
+                t_p = self._prev_chunk_t
+                x_p = self._prev_chunk_x
+                overlap_start = max(t_c[0], t_p[0])
+                overlap_end = min(t_c[-1], t_p[-1])
+                if overlap_start < overlap_end and overlap_start <= t_query <= overlap_end:
+                    val_old = self._interp_chunk(t_p, x_p, t_query)
+                    alpha = self._blend_weight(
+                        t_query, overlap_start, overlap_end
+                    )
+                    return (1.0 - alpha) * val_old + alpha * val_new
+
+            return val_new
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _interp_chunk(
+        self, t_c: np.ndarray, x_c: np.ndarray, t_query: float
+    ) -> np.ndarray:
+        """Interpolate within a single chunk."""
+        D = x_c.shape[1]
+
+        # Extrapolation handling
+        if t_query <= t_c[0]:
+            if self._extrapolation == "clamp":
+                return x_c[0].copy()
+            # linear: first-order hold backwards
+            if len(t_c) >= 2:
+                dt_c = t_c[1] - t_c[0]
+                if dt_c > 0:
+                    slope = (x_c[1] - x_c[0]) / dt_c
+                    return x_c[0] + slope * (t_query - t_c[0])
+            return x_c[0].copy()
+        if t_query >= t_c[-1]:
+            if self._extrapolation == "clamp":
+                return x_c[-1].copy()
+            if len(t_c) >= 2:
+                dt_c = t_c[-1] - t_c[-2]
+                if dt_c > 0:
+                    slope = (x_c[-1] - x_c[-2]) / dt_c
+                    return x_c[-1] + slope * (t_query - t_c[-1])
+            return x_c[-1].copy()
+
+        if self._interpolation == "pchip" and len(t_c) >= 4:
+            return np.array(
+                [
+                    float(
+                        sp_interpolate.PchipInterpolator(t_c, x_c[:, d])(
+                            t_query
+                        )
+                    )
+                    for d in range(D)
+                ]
+            )
+        # linear
+        return np.array(
+            [float(np.interp(t_query, t_c, x_c[:, d])) for d in range(D)]
+        )
+
+    def _blend_weight(
+        self, t_query: float, t_start: float, t_end: float
+    ) -> float:
+        """Return blend weight for the *new* chunk (0 = all old, 1 = all new).
+
+        Uses the soft mask schedule or linear ramp depending on blend_mode.
+        """
+        if t_end <= t_start:
+            return 1.0
+        frac = (t_query - t_start) / (t_end - t_start)
+        frac = float(np.clip(frac, 0.0, 1.0))
+
+        if self._blend_mode == "linear":
+            return frac
+
+        # soft_mask: exponential transition matching RTC Eq. 5 spirit
+        if frac >= 1.0:
+            return 1.0
+        c = 1.0 - frac  # c goes 1 → 0 as frac goes 0 → 1
+        old_weight = c * (np.exp(c) - 1.0) / (np.e - 1.0)
+        return 1.0 - old_weight
+
+    # ------------------------------------------------------------------
+    # Action-space inpainting
+    # ------------------------------------------------------------------
+
+    def _apply_inpainting(
+        self,
+        t_new: np.ndarray,
+        x_new: np.ndarray,
+        t_old: np.ndarray,
+        x_old: np.ndarray,
+    ) -> np.ndarray:
+        """Apply action-space inpainting to the incoming chunk.
+
+        Modifies *x_new* so that it is consistent with the frozen
+        prefix taken from the old (currently executing) chunk.
+
+        Must be called **inside** the lock.
+
+        Parameters
+        ----------
+        t_new, x_new : new chunk timestamps and values.
+        t_old, x_old : currently executing chunk timestamps and values.
+
+        Returns
+        -------
+        np.ndarray – inpainted copy of *x_new* (shape ``(N, D)``).
+        """
+        x_out = x_new.copy()
+        N = len(t_new)
+        D = x_new.shape[1]
+
+        # Get previous chunk's values at the new chunk's timestamps
+        # (interpolated where timestamps don't align exactly).
+        overlap_end = min(float(t_new[-1]), float(t_old[-1]))
+        overlap_start = float(t_new[0])
+        if overlap_start >= overlap_end:
+            return x_out  # no overlap → nothing to inpaint
+
+        # Interpolate old chunk at new chunk timestamps
+        x_old_at_new = np.column_stack(
+            [np.interp(t_new, t_old, x_old[:, d]) for d in range(D)]
+        )
+
+        # Build an overlap mask: True where t_new is within the old chunk range
+        in_overlap = (t_new >= t_old[0]) & (t_new <= t_old[-1])
+
+        d = self._estimate_delay()
+        s = max(d, self._s_min)
+
+        if self._inpainting == "hard":
+            self._inpaint_hard(x_out, x_old_at_new, in_overlap, d)
+        elif self._inpainting == "soft_mask":
+            self._inpaint_soft_mask(x_out, x_old_at_new, in_overlap, d, s)
+        elif self._inpainting == "hermite":
+            self._inpaint_hermite(
+                t_new, x_out, x_old_at_new, t_old, x_old, in_overlap, d,
+            )
+        elif self._inpainting == "callback":
+            mask = self._compute_soft_mask(d, s)
+            x_out = np.asarray(
+                self._inpainting_fn(
+                    x_out, x_old_at_new, t_new, t_old, mask, d,
+                ),
+                dtype=float,
+            )
+        return x_out
+
+    def _inpaint_hard(
+        self,
+        x_out: np.ndarray,
+        x_old_at_new: np.ndarray,
+        in_overlap: np.ndarray,
+        d: int,
+    ) -> None:
+        """Hard prefix replacement (training-time RTC style).
+
+        Replace the first *d* overlapping actions with frozen values
+        from the previous chunk.
+        """
+        overlap_indices = np.where(in_overlap)[0]
+        n_replace = min(d, len(overlap_indices))
+        if n_replace > 0:
+            idx = overlap_indices[:n_replace]
+            x_out[idx] = x_old_at_new[idx]
+
+    def _inpaint_soft_mask(
+        self,
+        x_out: np.ndarray,
+        x_old_at_new: np.ndarray,
+        in_overlap: np.ndarray,
+        d: int,
+        s: int,
+    ) -> None:
+        """Soft mask inpainting (inference-time RTC, Eq. 5).
+
+        Blend old and new chunk values using the exponentially decaying
+        soft mask across the entire overlap region.
+        """
+        overlap_indices = np.where(in_overlap)[0]
+        n_overlap = len(overlap_indices)
+        if n_overlap == 0:
+            return
+
+        W = self._compute_soft_mask(d, s)
+
+        for k, idx in enumerate(overlap_indices):
+            # Map overlap index k to soft mask index
+            if k < len(W):
+                w = W[k]
+            else:
+                w = 0.0
+            x_out[idx] = w * x_old_at_new[idx] + (1.0 - w) * x_out[idx]
+
+    def _inpaint_hermite(
+        self,
+        t_new: np.ndarray,
+        x_out: np.ndarray,
+        x_old_at_new: np.ndarray,
+        t_old: np.ndarray,
+        x_old: np.ndarray,
+        in_overlap: np.ndarray,
+        d: int,
+    ) -> None:
+        """Prefix replacement + cubic Hermite boundary smoothing.
+
+        1. Replace the first *d* overlapping actions with frozen values.
+        2. Apply a cubic Hermite polynomial transition over a short
+           region after the prefix boundary to ensure :math:`C^1`
+           continuity (matching position and velocity).
+        """
+        overlap_indices = np.where(in_overlap)[0]
+        n_replace = min(d, len(overlap_indices))
+        if n_replace == 0:
+            return
+
+        # Step 1: hard-replace prefix
+        replace_idx = overlap_indices[:n_replace]
+        x_out[replace_idx] = x_old_at_new[replace_idx]
+
+        # Step 2: Hermite blend over transition region after the prefix
+        boundary_idx = replace_idx[-1]  # last replaced index
+        trans_len = max(1, self._inpainting_transition)
+        trans_start = boundary_idx
+        trans_end = min(boundary_idx + trans_len, len(t_new) - 1)
+        if trans_end <= trans_start:
+            return
+
+        D = x_out.shape[1]
+        t_b = t_new[trans_start]
+        t_e = t_new[trans_end]
+        dt_region = t_e - t_b
+        if dt_region <= 0:
+            return
+
+        # Boundary conditions from the old chunk (position + velocity)
+        p0 = x_old_at_new[trans_start].copy()  # position at start
+        if trans_start > 0:
+            dt_prev = t_new[trans_start] - t_new[trans_start - 1]
+            if dt_prev > 0:
+                v0 = (x_old_at_new[trans_start] - x_old_at_new[trans_start - 1]) / dt_prev
+            else:
+                v0 = np.zeros(D)
+        else:
+            # Estimate velocity from old chunk directly
+            if len(t_old) >= 2:
+                dt_old = t_old[-1] - t_old[-2]
+                v0 = (x_old[-1] - x_old[-2]) / dt_old if dt_old > 0 else np.zeros(D)
+            else:
+                v0 = np.zeros(D)
+
+        # Target: the raw (un-inpainted) new chunk values at transition end
+        p1 = x_out[trans_end].copy()
+        if trans_end + 1 < len(t_new):
+            dt_next = t_new[trans_end + 1] - t_new[trans_end]
+            if dt_next > 0:
+                v1 = (x_out[trans_end + 1] - x_out[trans_end]) / dt_next
+            else:
+                v1 = np.zeros(D)
+        elif trans_end > 0:
+            dt_prev2 = t_new[trans_end] - t_new[trans_end - 1]
+            if dt_prev2 > 0:
+                v1 = (x_out[trans_end] - x_out[trans_end - 1]) / dt_prev2
+            else:
+                v1 = np.zeros(D)
+        else:
+            v1 = np.zeros(D)
+
+        # Cubic Hermite interpolation for indices in (trans_start, trans_end]
+        for i in range(trans_start + 1, trans_end + 1):
+            s = (t_new[i] - t_b) / dt_region  # normalised [0, 1]
+            # Hermite basis functions
+            h00 = 2 * s**3 - 3 * s**2 + 1
+            h10 = s**3 - 2 * s**2 + s
+            h01 = -2 * s**3 + 3 * s**2
+            h11 = s**3 - s**2
+            x_out[i] = (
+                h00 * p0 + h10 * dt_region * v0
+                + h01 * p1 + h11 * dt_region * v1
+            )
+
+    # -- hooks / ABC --------------------------------------------------------
+
+    def _on_clear(self) -> None:
+        self._curr_chunk_t = None
+        self._curr_chunk_x = None
+        self._prev_chunk_t = None
+        self._prev_chunk_x = None
+        self._chunk_switch_time = None
+        self._current_time = None
+        self._inference_start_time = None
+        self._delay_buf.clear()
+
+    def _compute(
+        self, t: np.ndarray, x: np.ndarray, t_query: float
+    ) -> np.ndarray:
+        # Delegate to chunk-aware output
+        if self._curr_chunk_t is not None:
+            return self._interp_chunk(
+                self._curr_chunk_t, self._curr_chunk_x, t_query
+            )
+        # Fallback: linear interpolation on the raw buffer
+        D = x.shape[1]
+        return np.array(
+            [float(np.interp(t_query, t, x[:, d])) for d in range(D)]
+        )
+
+
+# ======================================================================
+# Composite: RTC + RAIL
+# ======================================================================
+
+
+class AsyncFilterRTCRAIL(AsyncFilterRTC):
+    """RTC inpainting + RAIL polynomial smoothing composite filter.
+
+    Combines the strengths of both filters in a two-stage pipeline:
+
+    1. **RTC stage** – incoming action chunks are pre-processed with
+       action-space inpainting (hard / soft_mask / hermite / callback) so
+       the prefix region is continuous with currently-executing actions.
+    2. **RAIL stage** – the inpainted chunk is polynomial-fitted
+       (intra-chunk noise suppression) and blended at chunk boundaries
+       with C¹ or C² continuity.
+
+    :meth:`get_output` returns RAIL's smooth polynomial evaluation.
+    All RTC functionality (:meth:`get_prefix`, :meth:`start_inference`,
+    :attr:`delay_estimate`, :meth:`get_soft_mask`) remains available.
+
+    Parameters
+    ----------
+    buffer_size : int, optional
+        Per-sample buffer capacity (default: ``100``).
+
+    prediction_horizon : int
+        :math:`H` – action steps per chunk.
+    min_execution_horizon : int, optional
+        :math:`s_{\\min}` – minimum steps before next inference (default: ``1``).
+    dt : float
+        Controller period in seconds.
+    delay_buffer_size : int, optional
+        Past delays kept for estimation (default: ``5``).
+    initial_delay : int, optional
+        Seed value for delay buffer (default: ``1``).
+    delay_estimate_method : str, optional
+        ``'max'`` (default), ``'mean'``, or ``'ema'``.
+    inpainting : str, optional
+        RTC inpainting mode (default: ``'none'``).
+    inpainting_fn : callable, optional
+        Custom inpainting function for ``inpainting='callback'``.
+    inpainting_transition : int, optional
+        Hermite transition length.
+    blend_mode : str, optional
+        RTC blend mode — only used as a **fallback** when RAIL has not
+        yet received a second chunk.  Default: ``'soft_mask'``.
+    interpolation : str, optional
+        ``'linear'`` (default) or ``'pchip'`` – RTC fallback interpolation.
+    extrapolation : str, optional
+        ``'linear'`` (default) or ``'clamp'`` – RTC fallback extrapolation.
+
+    poly_degree : int, optional
+        RAIL polynomial degree for intra-chunk smoothing (default: ``3``).
+    blend_duration : float or None, optional
+        RAIL inter-chunk blend duration in seconds.  ``None`` = 30 %
+        of chunk duration.
+    dual_quintic : bool, optional
+        RAIL split-blend (default: ``True``).
+    blend_order : str, optional
+        RAIL boundary continuity: ``'cubic'`` (C¹, default) or
+        ``'quintic'`` (C²).
+    acc_clamp : float or None, optional
+        RAIL acceleration clamping for quintic blends.
+    rail_extrapolation : str, optional
+        RAIL extrapolation beyond fitted range (default: ``'linear'``).
+    auto_align : bool, optional
+        RAIL temporal alignment (default: ``False``).
+    align_method : str, optional
+        RAIL alignment algorithm (default: ``'direction'``).
+    align_window : float or None, optional
+        RAIL alignment search window.
+    blend_start_source : str, optional
+        RAIL blend start conditions (default: ``'actual_output'``).
+    """
+
+    def __init__(
+        self,
+        buffer_size: int = 100,
+        # --- RTC parameters ---
+        prediction_horizon: int = 50,
+        min_execution_horizon: int = 1,
+        dt: float = 0.02,
+        delay_buffer_size: int = 5,
+        initial_delay: int = 1,
+        delay_estimate_method: str = "max",
+        inpainting: str = "none",
+        inpainting_fn: Optional[Callable] = None,
+        inpainting_transition: Optional[int] = None,
+        blend_mode: str = "soft_mask",
+        interpolation: str = "linear",
+        extrapolation: str = "linear",
+        # --- RAIL parameters ---
+        poly_degree: int = 3,
+        blend_duration: Optional[float] = None,
+        dual_quintic: bool = True,
+        blend_order: str = "cubic",
+        acc_clamp: Optional[float] = None,
+        rail_extrapolation: str = "linear",
+        auto_align: bool = False,
+        align_method: str = "direction",
+        align_window: Optional[float] = None,
+        blend_start_source: str = "actual_output",
+    ) -> None:
+        super().__init__(
+            buffer_size=buffer_size,
+            prediction_horizon=prediction_horizon,
+            min_execution_horizon=min_execution_horizon,
+            dt=dt,
+            delay_buffer_size=delay_buffer_size,
+            initial_delay=initial_delay,
+            delay_estimate_method=delay_estimate_method,
+            inpainting=inpainting,
+            inpainting_fn=inpainting_fn,
+            inpainting_transition=inpainting_transition,
+            blend_mode=blend_mode,
+            interpolation=interpolation,
+            extrapolation=extrapolation,
+        )
+        self._rail = AsyncFilterRAIL(
+            buffer_size=buffer_size,
+            poly_degree=poly_degree,
+            blend_duration=blend_duration,
+            dual_quintic=dual_quintic,
+            auto_align=auto_align,
+            align_method=align_method,
+            align_window=align_window,
+            blend_start_source=blend_start_source,
+            blend_order=blend_order,
+            acc_clamp=acc_clamp,
+            extrapolation=rail_extrapolation,
+        )
+
+    # ------------------------------------------------------------------
+    # Chunk ingestion: RTC inpainting → RAIL polynomial fitting
+    # ------------------------------------------------------------------
+
+    def update_chunk(self, t, x) -> None:  # noqa: D401
+        """Register a chunk: apply RTC inpainting, then RAIL smoothing.
+
+        1. The RTC stage applies action-space inpainting (if enabled) so
+           the chunk prefix matches currently-executing actions.
+        2. The inpainted chunk is fed to RAIL for polynomial fitting and
+           boundary blending.
+
+        Parameters
+        ----------
+        t : array-like, shape (H,)
+            Timestamps for each action in the chunk.
+        x : array-like, shape (H, D) or (H,)
+            Action values.
+        """
+        t_arr = np.asarray(t, dtype=float).ravel()
+        x_arr = np.asarray(x, dtype=float)
+        if x_arr.ndim == 1:
+            x_arr = x_arr.reshape(-1, 1)
+        if x_arr.shape[0] != len(t_arr):
+            raise ValueError(
+                f"t has {len(t_arr)} samples but x has {x_arr.shape[0]}."
+            )
+
+        with self._lock:
+            if self._dim is None:
+                self._dim = x_arr.shape[1]
+
+            # Stage 1: RTC inpainting
+            if (
+                self._inpainting != "none"
+                and self._prev_chunk_t is not None
+                and self._curr_chunk_t is not None
+            ):
+                x_arr = self._apply_inpainting(
+                    t_arr, x_arr,
+                    self._curr_chunk_t, self._curr_chunk_x,
+                )
+
+            # Shift RTC chunk state
+            self._prev_chunk_t = self._curr_chunk_t
+            self._prev_chunk_x = self._curr_chunk_x
+            self._curr_chunk_t = t_arr.copy()
+            self._curr_chunk_x = x_arr.copy()
+            self._chunk_switch_time = self._current_time
+
+            # Auto-record delay
+            if (
+                self._inference_start_time is not None
+                and self._current_time is not None
+            ):
+                elapsed = self._current_time - self._inference_start_time
+                observed_delay = max(0, int(round(elapsed / self._dt)))
+                self._delay_buf.append(observed_delay)
+                self._inference_start_time = None
+
+            # Populate base buffer for compatibility
+            for ti, xi in zip(t_arr, x_arr):
+                self._t_buf.append(float(ti))
+                self._x_buf.append(xi.copy())
+
+        # Stage 2: RAIL polynomial fitting + boundary blending
+        self._rail.update_chunk(t_arr, x_arr)
+
+    # ------------------------------------------------------------------
+    # Output: RAIL polynomial evaluation with RTC fallback
+    # ------------------------------------------------------------------
+
+    def get_output(self, t: Optional[float] = None) -> Optional[np.ndarray]:
+        """Return the smoothed action at time *t*.
+
+        Delegates to RAIL's polynomial evaluation for smooth output.
+        Falls back to RTC's interpolation only if RAIL has not yet
+        received any chunk.
+
+        Parameters
+        ----------
+        t : float, optional
+            Query time.  Defaults to the latest trajectory endpoint.
+
+        Returns
+        -------
+        np.ndarray, shape (D,) or None
+        """
+        rail_out = self._rail.get_output(t)
+        if rail_out is not None:
+            return rail_out
+        return super().get_output(t)
+
+    # ------------------------------------------------------------------
+    # Prefix: use RAIL-smoothed values for consistency
+    # ------------------------------------------------------------------
+
+    def get_prefix(self) -> Optional[tuple[np.ndarray, np.ndarray, int]]:
+        """Return the frozen prefix re-evaluated through RAIL polynomials.
+
+        Unlike the base :class:`AsyncFilterRTC` which returns the raw
+        (inpainted) chunk values, this method evaluates prefix timestamps
+        against RAIL's polynomial trajectory.  This ensures that the
+        prefix handed to the VLA model matches what the robot actually
+        executed via :meth:`get_output`.
+
+        Falls back to the raw RTC prefix when RAIL has not yet built a
+        trajectory (e.g. before the first chunk).
+
+        Returns
+        -------
+        tuple of (t_prefix, x_prefix, delay) or None
+            ``t_prefix`` – shape ``(d,)`` timestamps.
+            ``x_prefix`` – shape ``(d, D)`` RAIL-smoothed action values.
+            ``delay``    – estimated delay in controller timesteps.
+            Returns ``None`` if no chunk has been registered yet.
+        """
+        # Step 1: Compute prefix timestamps and delay under RTC lock.
+        with self._lock:
+            if self._curr_chunk_t is None:
+                return None
+            d = self._estimate_delay()
+            s = max(d, self._s_min)
+            t_c = self._curr_chunk_t
+            prefix_start = min(s, len(t_c))
+            prefix_end = min(s + d, len(t_c))
+            if prefix_end <= prefix_start:
+                t_prefix = t_c[-1:].copy()
+            else:
+                t_prefix = t_c[prefix_start:prefix_end].copy()
+
+        # Step 2: Re-evaluate prefix values via RAIL polynomial (its own lock).
+        x_list = [self._rail.get_output(float(ti)) for ti in t_prefix]
+
+        if any(v is None for v in x_list):
+            # RAIL not ready yet — fall back to raw RTC prefix.
+            return super().get_prefix()
+
+        x_prefix = np.array(x_list)
+        return (t_prefix, x_prefix, d)
+
+    # ------------------------------------------------------------------
+    # Time management: propagate to both stages
+    # ------------------------------------------------------------------
+
+    def set_current_time(self, t: float) -> None:
+        """Inform both RTC and RAIL stages of current time."""
+        super().set_current_time(t)
+        self._rail.set_current_time(t)
+
+
 # ======================================================================
 # Factory
 # ======================================================================
@@ -1494,6 +2532,8 @@ _METHOD_MAP: dict[str, type[AsyncFilterBase]] = {
     "moving_average": AsyncFilterMovingAverage,
     "act": AsyncFilterACT,
     "rail": AsyncFilterRAIL,
+    "rtc": AsyncFilterRTC,
+    "rtc_rail": AsyncFilterRTCRAIL,
 }
 
 
@@ -1516,6 +2556,8 @@ def AsyncFilter(
         - ``'moving_average'`` – Sliding-window average.
         - ``'act'``            – Temporal ensembling of overlapping action chunks.
         - ``'rail'``           – Two-stage trajectory post-processing with C² fusion.
+        - ``'rtc'``            – Real-Time Chunking async execution framework.
+        - ``'rtc_rail'``       – RTC inpainting + RAIL polynomial smoothing.
 
     buffer_size : int, optional
         Maximum buffer capacity (default: ``100``).
