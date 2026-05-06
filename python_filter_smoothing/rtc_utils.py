@@ -30,8 +30,10 @@ def rtc_soft_mask(
     horizon: int,
     delay: int,
     execution_horizon: int,
+    *,
+    schedule: str = "exp",
 ) -> np.ndarray:
-    """Compute the RTC exponential-decay soft mask (Eq. 5).
+    """Compute the RTC soft mask (Eq. 5) with configurable schedule.
 
     Parameters
     ----------
@@ -41,13 +43,21 @@ def rtc_soft_mask(
         Estimated inference delay *d* (in controller timesteps).
     execution_horizon : int
         Execution horizon *s* (``max(d, s_min)``).
+    schedule : str, optional
+        Decay schedule for the overlap region (default ``"exp"``).
+
+        * ``"exp"``    – exponential decay ``c·(exp(c)−1)/(e−1)``
+          (original Eq. 5).
+        * ``"linear"`` – linear decay from 1 to 0.
+        * ``"ones"``   – hard mask, all 1 in prefix+overlap.
+        * ``"zeros"``  – no overlap blending, only prefix = 1.
 
     Returns
     -------
     np.ndarray
         Shape ``(H,)`` with values in ``[0, 1]``.
-        ``W[i] = 1`` for the frozen prefix, decaying exponentially in
-        the overlap region, and ``0`` in the free region.
+        ``W[i] = 1`` for the frozen prefix, decaying in the overlap
+        region according to *schedule*, and ``0`` in the free region.
     """
     H = int(horizon)
     d = max(0, min(int(delay), H - 1))
@@ -59,7 +69,19 @@ def rtc_soft_mask(
             W[i] = 1.0
         elif i < H - s and denom > 0:
             c = (H - s - i) / denom
-            W[i] = c * (np.exp(c) - 1.0) / (np.e - 1.0)
+            if schedule == "exp":
+                W[i] = c * (np.exp(c) - 1.0) / (np.e - 1.0)
+            elif schedule == "linear":
+                W[i] = c
+            elif schedule == "ones":
+                W[i] = 1.0
+            elif schedule == "zeros":
+                W[i] = 0.0
+            else:
+                raise ValueError(
+                    f"Unknown schedule '{schedule}'. "
+                    "Expected 'exp', 'linear', 'ones', or 'zeros'."
+                )
     return W
 
 
@@ -78,6 +100,14 @@ def _numerical_vjp(
     The full Jacobian is ``(H*D, H*D)``; we compute the VJP directly
     (one pair of forward passes per element of A^τ) using column-wise
     finite differences.
+
+    .. warning::
+
+       This function requires ``2 * H * D`` model forward passes
+       (e.g., 700 calls for H=50, D=7), which is extremely expensive.
+       For production use, always provide a ``vjp_fn`` to
+       :func:`rtc_pigdm_guidance` that leverages native autodiff
+       (PyTorch ``torch.autograd.grad`` / JAX ``jax.vjp``).
 
     Parameters
     ----------
@@ -130,6 +160,7 @@ def rtc_pigdm_guidance(
     beta: float = 1.0,
     vjp_fn: Optional[Callable] = None,
     eps: float = 1e-4,
+    v_precomputed: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     r"""Compute the ΠGDM guidance term (Eq. 4 of arXiv:2506.07339).
 
@@ -170,6 +201,10 @@ def rtc_pigdm_guidance(
         framework-native autodiff for efficiency.
     eps : float, optional
         Finite-difference step (used only when *vjp_fn* is ``None``).
+    v_precomputed : np.ndarray, optional
+        If provided, reuse this velocity array instead of calling
+        *model_fn* again.  This avoids a redundant forward pass when
+        :func:`rtc_pigdm_denoise_step` already computed the velocity.
 
     Returns
     -------
@@ -185,7 +220,10 @@ def rtc_pigdm_guidance(
     tau_arr = np.broadcast_to(np.asarray(tau, dtype=float), x_t.shape)
 
     # Base velocity and one-step prediction
-    v = np.asarray(model_fn(x_t, obs, tau), dtype=float)
+    if v_precomputed is not None:
+        v = np.asarray(v_precomputed, dtype=float)
+    else:
+        v = np.asarray(model_fn(x_t, obs, tau), dtype=float)
     A_hat_1 = x_t + (1.0 - tau_arr) * v  # predicted clean actions
 
     # Residual weighted by soft mask: (Y - Â¹) * diag(W)
@@ -257,12 +295,11 @@ def rtc_pigdm_denoise_step(
         ``τ + dt_flow``.
     """
     x_t = np.asarray(x_t, dtype=float)
-    tau_arr = np.full(x_t.shape, tau)
 
     v = np.asarray(model_fn(x_t, obs, tau), dtype=float)
     g = rtc_pigdm_guidance(
         model_fn, x_t, obs, tau, prefix, mask,
-        beta=beta, vjp_fn=vjp_fn, eps=eps,
+        beta=beta, vjp_fn=vjp_fn, eps=eps, v_precomputed=v,
     )
     x_next = x_t + dt_flow * (v + g)
     return x_next, tau + dt_flow
@@ -278,6 +315,7 @@ def rtc_training_prepare_batch(
     max_delay: int,
     *,
     rng: Optional[np.random.Generator] = None,
+    delay_distribution: str = "exponential",
 ) -> dict[str, np.ndarray]:
     r"""Prepare a training batch with simulated delay and prefix conditioning.
 
@@ -299,6 +337,11 @@ def rtc_training_prepare_batch(
         Upper bound (exclusive) for sampled delays.
     rng : np.random.Generator, optional
         Random number generator (default: ``np.random.default_rng()``).
+    delay_distribution : str, optional
+        How to sample delays.  ``"exponential"`` (default) uses
+        exponentially decaying weights biased toward smaller delays
+        (matching the reference Kinetix implementation).
+        ``"uniform"`` samples uniformly from ``[0, max_delay)``.
 
     Returns
     -------
@@ -322,7 +365,21 @@ def rtc_training_prepare_batch(
         rng = np.random.default_rng()
 
     noise = rng.standard_normal((B, H, D))
-    delay = rng.integers(0, max_delay, size=(B,))
+
+    # Sample delays according to distribution
+    if delay_distribution == "uniform":
+        delay = rng.integers(0, max_delay, size=(B,))
+    elif delay_distribution == "exponential":
+        # Exponentially decaying weights biased toward smaller delays
+        # (matching Kinetix reference implementation)
+        weights = np.exp(np.arange(max_delay, dtype=float)[::-1])
+        weights /= weights.sum()
+        delay = rng.choice(max_delay, size=(B,), p=weights)
+    else:
+        raise ValueError(
+            f"Unknown delay_distribution '{delay_distribution}'. "
+            "Expected 'exponential' or 'uniform'."
+        )
 
     # Per-example random τ (scalar per example, broadcast to H)
     base_time = rng.uniform(0.0, 1.0, size=(B,))

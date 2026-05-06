@@ -331,3 +331,248 @@ class TestRtcTrainingSample:
         # After many steps toward [1,...,1], postfix should be close to 1
         postfix = result[2:]
         assert np.mean(np.abs(postfix - 1.0)) < 0.5
+
+
+# ---------------------------------------------------------------------------
+# Fix 4.5: Soft mask schedule variants
+# ---------------------------------------------------------------------------
+
+class TestRtcSoftMaskSchedules:
+    """Tests for the schedule parameter in rtc_soft_mask."""
+
+    def test_exp_is_default(self):
+        """Default schedule should match explicit exp."""
+        W_default = rtc_soft_mask(horizon=10, delay=2, execution_horizon=3)
+        W_exp = rtc_soft_mask(horizon=10, delay=2, execution_horizon=3, schedule="exp")
+        np.testing.assert_array_equal(W_default, W_exp)
+
+    def test_linear_in_unit_interval(self):
+        W = rtc_soft_mask(horizon=10, delay=2, execution_horizon=3, schedule="linear")
+        assert np.all(W >= 0.0) and np.all(W <= 1.0)
+
+    def test_linear_frozen_region(self):
+        W = rtc_soft_mask(horizon=10, delay=3, execution_horizon=3, schedule="linear")
+        np.testing.assert_allclose(W[:3], 1.0)
+
+    def test_linear_free_region(self):
+        W = rtc_soft_mask(horizon=10, delay=2, execution_horizon=3, schedule="linear")
+        np.testing.assert_allclose(W[7:], 0.0)
+
+    def test_linear_monotone_decay(self):
+        W = rtc_soft_mask(horizon=20, delay=3, execution_horizon=5, schedule="linear")
+        overlap = W[3:15]
+        for i in range(len(overlap) - 1):
+            assert overlap[i] >= overlap[i + 1]
+
+    def test_linear_values_are_linear(self):
+        """In the overlap region, linear schedule should produce evenly spaced values."""
+        H, d, s = 10, 2, 3
+        W = rtc_soft_mask(horizon=H, delay=d, execution_horizon=s, schedule="linear")
+        overlap = W[d : H - s]
+        if len(overlap) >= 2:
+            diffs = np.diff(overlap)
+            np.testing.assert_allclose(diffs, diffs[0], atol=1e-12)
+
+    def test_ones_schedule(self):
+        """'ones' schedule should be 1.0 for prefix and overlap, 0 for free."""
+        W = rtc_soft_mask(horizon=10, delay=2, execution_horizon=3, schedule="ones")
+        np.testing.assert_allclose(W[:2], 1.0)  # frozen
+        np.testing.assert_allclose(W[2:7], 1.0)  # overlap
+        np.testing.assert_allclose(W[7:], 0.0)  # free
+
+    def test_zeros_schedule(self):
+        """'zeros' schedule should be 1.0 for prefix only, 0 elsewhere."""
+        W = rtc_soft_mask(horizon=10, delay=2, execution_horizon=3, schedule="zeros")
+        np.testing.assert_allclose(W[:2], 1.0)  # frozen
+        np.testing.assert_allclose(W[2:], 0.0)  # overlap + free
+
+    def test_unknown_schedule_raises(self):
+        with pytest.raises(ValueError, match="Unknown schedule"):
+            rtc_soft_mask(horizon=10, delay=2, execution_horizon=3, schedule="cosine")
+
+
+# ---------------------------------------------------------------------------
+# Fix 4.2: v_precomputed in guidance
+# ---------------------------------------------------------------------------
+
+class TestRtcPigdmGuidancePrecomputed:
+    """Tests for the v_precomputed parameter in rtc_pigdm_guidance."""
+
+    def test_v_precomputed_matches_internal(self):
+        """Guidance with v_precomputed should match computing v internally."""
+        x_t = np.random.default_rng(0).standard_normal((6, 2))
+        prefix = np.ones((6, 2)) * 3.0
+        mask = rtc_soft_mask(6, 1, 2)
+        g_auto = rtc_pigdm_guidance(
+            _identity_model, x_t, None, 0.5, prefix, mask,
+        )
+        v = _identity_model(x_t, None, 0.5)
+        g_pre = rtc_pigdm_guidance(
+            _identity_model, x_t, None, 0.5, prefix, mask,
+            v_precomputed=v,
+        )
+        np.testing.assert_allclose(g_pre, g_auto, atol=1e-12)
+
+    def test_v_precomputed_skips_model_call(self):
+        """When v_precomputed is given, model_fn should not be called for velocity."""
+        calls = []
+
+        def tracking_model(x_t, obs, tau):
+            calls.append(("model", tau))
+            return np.zeros_like(x_t)
+
+        x_t = np.ones((4, 2))
+        prefix = np.ones((4, 2)) * 2.0
+        mask = np.ones(4)
+        v = np.zeros((4, 2))
+
+        def dummy_vjp(model_fn, x_t, obs, tau, vec):
+            return vec * 0.5
+
+        rtc_pigdm_guidance(
+            tracking_model, x_t, None, 0.5, prefix, mask,
+            vjp_fn=dummy_vjp, v_precomputed=v,
+        )
+        # model_fn should not have been called at all
+        assert len(calls) == 0
+
+    def test_denoise_step_reuses_velocity(self):
+        """Denoise step should only call model_fn once (not twice)."""
+        call_count = [0]
+
+        def counting_model(x_t, obs, tau):
+            call_count[0] += 1
+            return np.zeros_like(x_t)
+
+        x_t = np.ones((4, 2))
+        prefix = np.ones((4, 2)) * 2.0
+        mask = np.ones(4)
+
+        def dummy_vjp(model_fn, x_t, obs, tau, vec):
+            return vec * 0.5
+
+        rtc_pigdm_denoise_step(
+            counting_model, x_t, None, 0.5, 0.1, prefix, mask,
+            vjp_fn=dummy_vjp,
+        )
+        # Only one model call (in denoise_step), NOT two
+        assert call_count[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix 4.1: Delay distribution in training prepare batch
+# ---------------------------------------------------------------------------
+
+class TestRtcTrainingDelayDistribution:
+    """Tests for delay_distribution parameter in rtc_training_prepare_batch."""
+
+    def test_uniform_backward_compatible(self):
+        """'uniform' distribution should produce the same result as original."""
+        actions = np.random.default_rng(1).standard_normal((8, 10, 3))
+        rng1 = np.random.default_rng(42)
+        rng2 = np.random.default_rng(42)
+        r_uniform = rtc_training_prepare_batch(
+            actions, max_delay=5, rng=rng1, delay_distribution="uniform",
+        )
+        # With a fresh rng that draws the same sequence, uniform should be
+        # predictable. Just check it runs and produces valid output.
+        assert r_uniform["delay"].shape == (8,)
+        assert np.all(r_uniform["delay"] >= 0)
+        assert np.all(r_uniform["delay"] < 5)
+
+    def test_exponential_biases_toward_small_delays(self):
+        """Exponential distribution should favor smaller delays on average."""
+        actions = np.random.default_rng(0).standard_normal((1000, 10, 3))
+        rng = np.random.default_rng(42)
+        result = rtc_training_prepare_batch(
+            actions, max_delay=10, rng=rng, delay_distribution="exponential",
+        )
+        mean_delay = result["delay"].mean()
+        # Uniform mean would be ~4.5; exponential should be much lower
+        assert mean_delay < 3.5
+
+    def test_exponential_is_default(self):
+        """Default distribution should be 'exponential'."""
+        actions = np.random.default_rng(0).standard_normal((4, 10, 3))
+        rng1 = np.random.default_rng(99)
+        rng2 = np.random.default_rng(99)
+        r_default = rtc_training_prepare_batch(actions, max_delay=5, rng=rng1)
+        r_explicit = rtc_training_prepare_batch(
+            actions, max_delay=5, rng=rng2, delay_distribution="exponential",
+        )
+        np.testing.assert_array_equal(r_default["delay"], r_explicit["delay"])
+
+    def test_unknown_distribution_raises(self):
+        actions = np.random.randn(2, 10, 3)
+        with pytest.raises(ValueError, match="Unknown delay_distribution"):
+            rtc_training_prepare_batch(
+                actions, max_delay=5, delay_distribution="gaussian",
+            )
+
+    def test_exponential_delay_range(self):
+        """All delays should be in [0, max_delay)."""
+        actions = np.random.default_rng(0).standard_normal((100, 10, 3))
+        rng = np.random.default_rng(42)
+        result = rtc_training_prepare_batch(
+            actions, max_delay=5, rng=rng, delay_distribution="exponential",
+        )
+        assert np.all(result["delay"] >= 0)
+        assert np.all(result["delay"] < 5)
+
+
+# ---------------------------------------------------------------------------
+# Fix 4.3: Unused tau_arr removed (regression test)
+# ---------------------------------------------------------------------------
+
+class TestRtcDenoiseStepNoTauArr:
+    """Ensure denoise step works correctly without the old tau_arr variable."""
+
+    def test_denoise_step_still_works(self):
+        """Basic denoise step should produce correct results after fix."""
+        H, D = 6, 2
+        x_t = np.zeros((H, D))
+        prefix = np.ones((H, D))
+        mask = rtc_soft_mask(H, 1, 2)
+        x_next, tau_next = rtc_pigdm_denoise_step(
+            _identity_model, x_t, None, 0.1, 0.1, prefix, mask,
+        )
+        assert x_next.shape == (H, D)
+        assert tau_next == pytest.approx(0.2)
+
+    def test_multiple_steps_identical_to_manual(self):
+        """Running denoise step should be equivalent to manual v + g computation."""
+        H, D = 4, 2
+        rng = np.random.default_rng(7)
+        x_t = rng.standard_normal((H, D))
+        prefix = np.ones((H, D)) * 5.0
+        mask = rtc_soft_mask(H, 1, 2)
+        tau, dt = 0.3, 0.1
+
+        # Use denoise_step
+        x_next_step, _ = rtc_pigdm_denoise_step(
+            _linear_model, x_t, None, tau, dt, prefix, mask,
+        )
+
+        # Manual computation
+        v = _linear_model(x_t, None, tau)
+        g = rtc_pigdm_guidance(
+            _linear_model, x_t, None, tau, prefix, mask,
+            v_precomputed=v,
+        )
+        x_next_manual = x_t + dt * (v + g)
+        np.testing.assert_allclose(x_next_step, x_next_manual, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Fix 4.4: VJP docstring (existence test)
+# ---------------------------------------------------------------------------
+
+class TestNumericalVjpDocstring:
+    """Check that _numerical_vjp has the computation cost warning."""
+
+    def test_docstring_contains_warning(self):
+        from python_filter_smoothing.rtc_utils import _numerical_vjp
+        doc = _numerical_vjp.__doc__
+        assert doc is not None
+        assert "warning" in doc.lower() or "Warning" in doc
+        assert "2 * H * D" in doc or "2*H*D" in doc

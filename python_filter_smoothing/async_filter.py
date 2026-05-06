@@ -1579,6 +1579,11 @@ class AsyncFilterRTC(AsyncFilterBase):
         * ``'soft_mask'``  – blend old and new chunk values using the
           RTC soft mask weights (default).
         * ``'linear'``     – linear cross-fade over the overlap region.
+    mask_schedule : str, optional
+        Decay schedule for the soft mask overlap region
+        (default ``"exp"``).  Passed through to :func:`rtc_soft_mask`.
+        See that function's docstring for available options:
+        ``"exp"``, ``"linear"``, ``"ones"``, ``"zeros"``.
     interpolation : str, optional
         Temporal interpolation within a chunk: ``'linear'`` (default) or
         ``'pchip'``.
@@ -1601,6 +1606,7 @@ class AsyncFilterRTC(AsyncFilterBase):
         inpainting_fn: Optional[Callable] = None,
         inpainting_transition: Optional[int] = None,
         blend_mode: str = "soft_mask",
+        mask_schedule: str = "exp",
         interpolation: str = "linear",
         extrapolation: str = "linear",
     ) -> None:
@@ -1623,6 +1629,8 @@ class AsyncFilterRTC(AsyncFilterBase):
             )
         if blend_mode not in ("none", "soft_mask", "linear"):
             raise ValueError(f"Unknown blend_mode '{blend_mode}'.")
+        if mask_schedule not in ("exp", "linear", "ones", "zeros"):
+            raise ValueError(f"Unknown mask_schedule '{mask_schedule}'.")
         if interpolation not in ("linear", "pchip"):
             raise ValueError(f"Unknown interpolation '{interpolation}'.")
         if extrapolation not in ("linear", "clamp"):
@@ -1639,6 +1647,7 @@ class AsyncFilterRTC(AsyncFilterBase):
             else min(4, self._H // 4)
         )
         self._blend_mode = blend_mode
+        self._mask_schedule = mask_schedule
         self._interpolation = interpolation
         self._extrapolation = extrapolation
         self._delay_est_method = delay_estimate_method
@@ -1740,19 +1749,9 @@ class AsyncFilterRTC(AsyncFilterBase):
 
     def _compute_soft_mask(self, d: int, s: int) -> np.ndarray:
         """Compute soft mask (no lock needed, pure function)."""
-        H = self._H
-        d = max(0, min(d, H - 1))
-        s = max(1, min(s, H))
-        W = np.zeros(H)
-        denom = H - s - d + 1
-        for i in range(H):
-            if i < d:
-                W[i] = 1.0
-            elif i < H - s and denom > 0:
-                c = (H - s - i) / denom
-                W[i] = c * (np.exp(c) - 1.0) / (np.e - 1.0)
-            # else: 0.0
-        return W
+        from .rtc_utils import rtc_soft_mask
+
+        return rtc_soft_mask(self._H, d, s, schedule=self._mask_schedule)
 
     # ------------------------------------------------------------------
     # Prefix for next inference

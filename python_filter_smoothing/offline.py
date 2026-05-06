@@ -593,6 +593,55 @@ def _design_iir_sos(
     return sos
 
 
+def _design_iir_analog_ss(
+    cutoff_freq: float | list[float],
+    order: int,
+    iir_type: str,
+    btype: str,
+    rp: float | None,
+    rs: float | None,
+) -> tuple:
+    """Design an analog IIR prototype and return continuous-time SS matrices.
+
+    Returns (A_c, B_c, C_c, D_c) suitable for ZOH discretization.
+    """
+    if isinstance(cutoff_freq, (list, tuple)):
+        w0 = [2.0 * np.pi * float(f) for f in cutoff_freq]
+    else:
+        w0 = 2.0 * np.pi * float(cutoff_freq)
+
+    if iir_type == "butterworth":
+        zpk = sp_signal.butter(order, w0, btype=btype, analog=True, output="zpk")
+    elif iir_type == "chebyshev1":
+        if rp is None:
+            raise ValueError("'chebyshev1' requires 'rp' (passband ripple in dB).")
+        zpk = sp_signal.cheby1(order, rp, w0, btype=btype, analog=True, output="zpk")
+    elif iir_type == "chebyshev2":
+        if rs is None:
+            raise ValueError("'chebyshev2' requires 'rs' (stopband attenuation in dB).")
+        zpk = sp_signal.cheby2(order, rs, w0, btype=btype, analog=True, output="zpk")
+    elif iir_type == "elliptic":
+        if rp is None or rs is None:
+            raise ValueError(
+                "'elliptic' requires both 'rp' (passband ripple) and "
+                "'rs' (stopband attenuation) in dB."
+            )
+        zpk = sp_signal.ellip(order, rp, rs, w0, btype=btype, analog=True, output="zpk")
+    elif iir_type == "bessel":
+        zpk = sp_signal.bessel(
+            order, w0, btype=btype, analog=True, output="zpk", norm="phase",
+        )
+    else:
+        raise ValueError(
+            f"Unknown iir_type '{iir_type}'. "
+            f"Choose from: {', '.join(repr(t) for t in OfflineFilter._IIR_TYPES)}."
+        )
+
+    b, a = sp_signal.zpk2tf(*zpk)
+    A_c, B_c, C_c, D_c = sp_signal.tf2ss(b, a)
+    return A_c, B_c, C_c, D_c
+
+
 def _build_kalman_model(
     D: int,
     dt: float,

@@ -40,23 +40,32 @@ class OnlineFilterBase(ABC):
     Subclasses implement :meth:`_init_impl`, :meth:`_update_impl`, and
     :meth:`_reset_impl`.  All common bookkeeping (array conversion,
     first-sample initialisation, state copying) lives here.
+
+    Variable sampling periods are supported: :meth:`update` computes the
+    elapsed time since the previous call and passes it as *dt* to
+    :meth:`_update_impl`, allowing each subclass to adapt its parameters
+    accordingly.
     """
 
     def __init__(self, **kwargs) -> None:  # noqa: ARG002
         self._dim: Optional[int] = None
         self._state: Optional[np.ndarray] = None
+        self._prev_t: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def update(self, t: float, x) -> np.ndarray:  # noqa: ARG002
+    def update(self, t: float, x) -> np.ndarray:
         """Process a new sample and return the filtered value.
 
         Parameters
         ----------
         t : float
-            Timestamp of the new sample (used for record-keeping).
+            Timestamp of the new sample (seconds).  The elapsed time
+            *dt = t - t_prev* is computed automatically and forwarded to
+            :meth:`_update_impl`, enabling each subclass to handle
+            variable sampling periods.
         x : scalar or array-like
             Observed value.  Scalar and 1-D inputs are both accepted.
 
@@ -69,9 +78,14 @@ class OnlineFilterBase(ABC):
         if self._dim is None:
             self._dim = x.size
             self._state = x.copy()
+            self._prev_t = float(t)
             self._init_impl(x)
         else:
-            self._update_impl(x)
+            dt = float(t) - self._prev_t
+            if dt <= 0.0:
+                dt = 1e-9
+            self._update_impl(x, dt)
+            self._prev_t = float(t)
         return self._state.copy()
 
     def get_value(self) -> Optional[np.ndarray]:
@@ -89,6 +103,7 @@ class OnlineFilterBase(ABC):
         """Reset the filter, clearing all history and internal state."""
         self._dim = None
         self._state = None
+        self._prev_t = None
         self._reset_impl()
 
     # ------------------------------------------------------------------
@@ -100,8 +115,16 @@ class OnlineFilterBase(ABC):
         """Initialise method-specific state on the first sample."""
 
     @abstractmethod
-    def _update_impl(self, x: np.ndarray) -> None:
-        """Update the filter with a new sample (called after the first)."""
+    def _update_impl(self, x: np.ndarray, dt: float) -> None:
+        """Update the filter with a new sample (called after the first).
+
+        Parameters
+        ----------
+        x : np.ndarray
+            New observation.
+        dt : float
+            Elapsed time since the previous sample (always > 0).
+        """
 
     @abstractmethod
     def _reset_impl(self) -> None:
@@ -116,22 +139,44 @@ class OnlineFilterBase(ABC):
 class OnlineFilterEMA(OnlineFilterBase):
     """Exponential moving average filter.
 
+    The smoothing factor is adapted to the actual sampling interval so
+    that the filter's time constant is preserved when the period varies.
+    Internally, ``alpha`` and ``dt_nominal`` are converted to an RC time
+    constant ``τ = -dt_nominal / ln(1 - alpha)``.  At each update the
+    effective alpha is recomputed as ``1 - exp(-dt / τ)``.
+
+    When the period equals *dt_nominal* the filter behaves identically to
+    a fixed-rate EMA with the given ``alpha``, ensuring backward
+    compatibility.
+
     Parameters
     ----------
     alpha : float, optional
-        Smoothing factor in ``(0, 1]``.  Higher values weight recent
-        samples more heavily (default: ``0.3``).
+        Smoothing factor in ``(0, 1]`` at the nominal sampling period.
+        Higher values weight recent samples more heavily (default: ``0.3``).
+    dt_nominal : float, optional
+        Nominal sampling interval (seconds) that ``alpha`` was designed
+        for (default: ``1.0``).
     """
 
-    def __init__(self, alpha: float = 0.3) -> None:
+    def __init__(self, alpha: float = 0.3, dt_nominal: float = 1.0) -> None:
         super().__init__()
         self._alpha = float(alpha)
+        self._dt_nominal = float(dt_nominal)
+        if self._alpha >= 1.0:
+            self._tau = 0.0
+        else:
+            self._tau = -float(dt_nominal) / np.log(1.0 - self._alpha)
 
     def _init_impl(self, x: np.ndarray) -> None:  # noqa: ARG002
         pass  # state already set to first sample by base class
 
-    def _update_impl(self, x: np.ndarray) -> None:
-        self._state = self._alpha * x + (1.0 - self._alpha) * self._state
+    def _update_impl(self, x: np.ndarray, dt: float) -> None:
+        if self._tau <= 0.0:
+            self._state = x.copy()
+        else:
+            alpha_t = 1.0 - np.exp(-dt / self._tau)
+            self._state = alpha_t * x + (1.0 - alpha_t) * self._state
 
     def _reset_impl(self) -> None:
         pass
@@ -140,41 +185,85 @@ class OnlineFilterEMA(OnlineFilterBase):
 class OnlineFilterMovingAverage(OnlineFilterBase):
     """Simple sliding-window average filter.
 
+    Two windowing modes are available:
+
+    * **Sample-based** (default): keep the last ``window`` samples.
+    * **Time-based**: keep all samples within the most recent
+      ``window_time`` seconds.  When ``window_time`` is given,
+      ``window`` is ignored and the effective number of averaged
+      samples adapts automatically to the actual sampling rate,
+      making the filter correct under variable periods.
+
     Parameters
     ----------
     window : int, optional
-        Window length in samples (default: ``10``).
+        Window length in samples (default: ``10``).  Used only when
+        ``window_time`` is ``None``.
+    window_time : float, optional
+        Time-based window length in seconds.  When provided, only
+        samples with timestamps within ``[t_now - window_time, t_now]``
+        are averaged (default: ``None``).
     """
 
-    def __init__(self, window: int = 10) -> None:
+    def __init__(
+        self,
+        window: int = 10,
+        window_time: float | None = None,
+    ) -> None:
         super().__init__()
         self._window_size = int(window)
-        self._buffer: Optional[deque] = None
+        self._window_time = float(window_time) if window_time is not None else None
+        self._buffer: deque | None = None
+        # Time-based: list of (timestamp, value) pairs
+        self._t_buffer: list | None = None
 
     def _init_impl(self, x: np.ndarray) -> None:
-        self._buffer = deque(maxlen=self._window_size)
-        self._buffer.append(x.copy())
+        if self._window_time is not None:
+            self._t_buffer = [(self._prev_t, x.copy())]
+        else:
+            self._buffer = deque(maxlen=self._window_size)
+            self._buffer.append(x.copy())
 
-    def _update_impl(self, x: np.ndarray) -> None:
-        self._buffer.append(x.copy())
-        self._state = np.mean(np.stack(list(self._buffer)), axis=0)
+    def _update_impl(self, x: np.ndarray, dt: float) -> None:
+        if self._window_time is not None:
+            t_now = self._prev_t + dt
+            self._t_buffer.append((t_now, x.copy()))
+            cutoff = t_now - self._window_time
+            self._t_buffer = [(t, v) for t, v in self._t_buffer if t >= cutoff]
+            self._state = np.mean(
+                np.stack([v for _, v in self._t_buffer]), axis=0
+            )
+        else:
+            self._buffer.append(x.copy())
+            self._state = np.mean(np.stack(list(self._buffer)), axis=0)
 
     def _reset_impl(self) -> None:
         self._buffer = None
+        self._t_buffer = None
 
 
 class OnlineFilterLowpass(OnlineFilterBase):
-    """Causal IIR Butterworth low-pass filter.
+    """Causal Butterworth low-pass filter with variable-period support.
+
+    Internally the filter is designed as a continuous-time analog
+    Butterworth prototype and discretized at each step using the
+    **zero-order hold (ZOH)** method.  When the sampling interval is
+    constant the result is equivalent to the standard digital design;
+    when it varies the filter adapts correctly by re-discretizing with
+    the actual elapsed time.
+
+    Discretized matrices are cached so that re-discretization only
+    occurs when the elapsed time changes, keeping the per-sample cost
+    to O(n²) in the filter order (matrix–vector products).
 
     Parameters
     ----------
     cutoff_freq : float, optional
-        Cutoff frequency in the same units as ``sample_rate``
-        (default: ``0.1``).  Internally normalised to the Nyquist
-        frequency as ``cutoff_freq / (0.5 * sample_rate)``.
+        Cutoff frequency in Hz (same units as ``sample_rate``)
+        (default: ``0.1``).
     sample_rate : float, optional
-        Sampling rate used to normalise ``cutoff_freq``
-        (default: ``1.0``).
+        Nominal sampling rate in Hz, used for Nyquist validation and
+        for the steady-state initial conditions (default: ``1.0``).
     order : int, optional
         Filter order (default: ``2``).
     """
@@ -186,33 +275,63 @@ class OnlineFilterLowpass(OnlineFilterBase):
         order: int = 2,
     ) -> None:
         super().__init__()
-        nyq = 0.5 * float(sample_rate)
-        wn = float(cutoff_freq) / nyq
-        if not (0.0 < wn < 1.0):
+        sample_rate = float(sample_rate)
+        cutoff_freq = float(cutoff_freq)
+        if not (0.0 < cutoff_freq < 0.5 * sample_rate):
             raise ValueError(
-                f"Normalised cutoff frequency must be in (0, 1); got {wn:.4f}. "
-                "Check cutoff_freq and sample_rate values."
+                f"cutoff_freq must be in (0, {0.5 * sample_rate}); "
+                f"got {cutoff_freq:.4f}."
             )
-        self._b, self._a = sp_signal.butter(int(order), wn, btype="low")
-        self._zi: Optional[np.ndarray] = None
+        # Analog prototype in rad/s
+        w0 = 2.0 * np.pi * cutoff_freq
+        b_a, a_a = sp_signal.butter(int(order), w0, btype="low", analog=True)
+        self._A_c, self._B_c, self._C_c, self._D_c = sp_signal.tf2ss(b_a, a_a)
+        self._dt_nominal = 1.0 / sample_rate
+        # ZOH cache
+        self._dt_cached: float | None = None
+        self._A_d: np.ndarray | None = None
+        self._B_d: np.ndarray | None = None
+        self._C_d: np.ndarray | None = None
+        self._D_d: np.ndarray | None = None
+        self._x_state: np.ndarray | None = None
+
+    def _get_discrete(self, dt: float) -> None:
+        if dt != self._dt_cached:
+            res = sp_signal.cont2discrete(
+                (self._A_c, self._B_c, self._C_c, self._D_c), dt, method="zoh",
+            )
+            self._A_d, self._B_d, self._C_d, self._D_d = (
+                res[0], res[1], res[2], res[3],
+            )
+            self._dt_cached = dt
 
     def _init_impl(self, x: np.ndarray) -> None:
-        n_states = max(len(self._b), len(self._a)) - 1
-        self._zi = np.zeros((n_states, self._dim))
-        zi_1d = sp_signal.lfilter_zi(self._b, self._a)
-        for d in range(self._dim):
-            self._zi[:, d] = zi_1d * x[d]
+        self._get_discrete(self._dt_nominal)
+        n = self._A_d.shape[0]
+        self._x_state = np.zeros((n, self._dim))
+        # Steady-state: x_ss = (I - A_d)^{-1} B_d * u
+        try:
+            x_ss_1d = np.linalg.solve(np.eye(n) - self._A_d, self._B_d.ravel())
+            for d in range(self._dim):
+                self._x_state[:, d] = x_ss_1d * x[d]
+        except np.linalg.LinAlgError:
+            pass  # fall back to zero initial state
 
-    def _update_impl(self, x: np.ndarray) -> None:
+    def _update_impl(self, x: np.ndarray, dt: float) -> None:
+        self._get_discrete(dt)
+        B_flat = self._B_d.ravel()
+        D_val = self._D_d.item()
         for d in range(self._dim):
-            y, zi_new = sp_signal.lfilter(
-                self._b, self._a, [x[d]], zi=self._zi[:, d]
-            )
-            self._state[d] = y[0]
-            self._zi[:, d] = zi_new
+            # Integrate state first (ZOH: hold u[k] over [t_{k-1}, t_k]),
+            # then read output from the updated state.  This avoids the
+            # time-varying one-step lag that the reversed order introduces
+            # when dt is non-uniform.
+            self._x_state[:, d] = self._A_d @ self._x_state[:, d] + B_flat * x[d]
+            self._state[d] = (self._C_d @ self._x_state[:, d]).item() + D_val * x[d]
 
     def _reset_impl(self) -> None:
-        self._zi = None
+        self._dt_cached = None
+        self._x_state = None
 
 
 class OnlineFilterOneEuro(OnlineFilterBase):
@@ -257,9 +376,8 @@ class OnlineFilterOneEuro(OnlineFilterBase):
     def _init_impl(self, x: np.ndarray) -> None:
         self._dx_state = np.zeros_like(x)
 
-    def _update_impl(self, x: np.ndarray) -> None:
-        # This is called from update() which receives t but base class
-        # doesn't forward it.  We override update() instead.
+    def _update_impl(self, x: np.ndarray, dt: float) -> None:  # noqa: ARG002
+        # Variable-period logic is handled in the overridden update() below.
         pass
 
     def update(self, t: float, x) -> np.ndarray:
@@ -308,6 +426,14 @@ class OnlineFilterFIR(OnlineFilterBase):
     Designs an FIR filter with :func:`scipy.signal.firwin` and applies
     it causally by maintaining a buffer of the last ``numtaps`` samples.
 
+    .. note::
+        FIR filters operate on a fixed sample-count window with
+        pre-designed coefficients, so the frequency response is only
+        correct when the sampling period is constant and equals
+        ``1 / sample_rate``.  For variable-period data, consider
+        :class:`OnlineFilterIIR`, :class:`OnlineFilterLowpass`, or
+        :class:`OnlineFilterOneEuro` instead.
+
     Parameters
     ----------
     numtaps : int
@@ -316,7 +442,7 @@ class OnlineFilterFIR(OnlineFilterBase):
         Cutoff frequency (or frequencies) in the same units as
         ``sample_rate``.
     sample_rate : float
-        Sampling rate of the data.
+        Nominal sampling rate of the data.
     window : str, optional
         Window function (default: ``'hamming'``).
     pass_zero : bool or str, optional
@@ -345,7 +471,7 @@ class OnlineFilterFIR(OnlineFilterBase):
         for _ in range(self._numtaps):
             self._buffer.append(x.copy())
 
-    def _update_impl(self, x: np.ndarray) -> None:
+    def _update_impl(self, x: np.ndarray, dt: float) -> None:  # noqa: ARG002
         self._buffer.append(x.copy())
         buf = np.array(list(self._buffer))  # (numtaps, D)
         # Convolution: y = sum(b[k] * x[n-k])
@@ -362,11 +488,14 @@ class OnlineFilterFIR(OnlineFilterBase):
 
 
 class OnlineFilterIIR(OnlineFilterBase):
-    """Causal IIR filter with selectable filter family.
+    """Causal IIR filter with selectable filter family and variable-period support.
 
     Supports Butterworth, Chebyshev Type I/II, Elliptic, and Bessel
-    filters in SOS form for numerical stability.  Processes one sample
-    at a time using :func:`scipy.signal.sosfilt` with maintained state.
+    filters.  Like :class:`OnlineFilterLowpass`, the filter is designed
+    as a continuous-time analog prototype and re-discretized at each
+    step via the **ZOH method**, so that variable sampling intervals are
+    handled correctly.  Discretized matrices are cached and recomputed
+    only when the elapsed time changes.
 
     Parameters
     ----------
@@ -374,7 +503,8 @@ class OnlineFilterIIR(OnlineFilterBase):
         Cutoff frequency (or frequencies for band filters) in the same
         units as ``sample_rate``.
     sample_rate : float
-        Sampling rate of the data.
+        Nominal sampling rate of the data, used for Nyquist validation
+        and steady-state initialisation.
     order : int, optional
         Filter order (default: ``4``).
     iir_type : str, optional
@@ -400,31 +530,52 @@ class OnlineFilterIIR(OnlineFilterBase):
         rs: float | None = None,
     ) -> None:
         super().__init__()
-        from .offline import _design_iir_sos
+        from .offline import _design_iir_analog_ss
 
-        self._sos = _design_iir_sos(
-            cutoff_freq, sample_rate, order, iir_type, btype, rp, rs,
+        self._A_c, self._B_c, self._C_c, self._D_c = _design_iir_analog_ss(
+            cutoff_freq, order, iir_type, btype, rp, rs,
         )
-        self._zi: np.ndarray | None = None
+        self._dt_nominal = 1.0 / float(sample_rate)
+        # ZOH cache
+        self._dt_cached: float | None = None
+        self._A_d: np.ndarray | None = None
+        self._B_d: np.ndarray | None = None
+        self._C_d: np.ndarray | None = None
+        self._D_d: np.ndarray | None = None
+        self._x_state: np.ndarray | None = None
+
+    def _get_discrete(self, dt: float) -> None:
+        if dt != self._dt_cached:
+            res = sp_signal.cont2discrete(
+                (self._A_c, self._B_c, self._C_c, self._D_c), dt, method="zoh",
+            )
+            self._A_d, self._B_d, self._C_d, self._D_d = (
+                res[0], res[1], res[2], res[3],
+            )
+            self._dt_cached = dt
 
     def _init_impl(self, x: np.ndarray) -> None:
-        n_sections = self._sos.shape[0]
-        # zi shape: (n_sections, 2) per dimension
-        zi_1d = sp_signal.sosfilt_zi(self._sos)  # (n_sections, 2)
-        self._zi = np.zeros((n_sections, 2, self._dim))
-        for d in range(self._dim):
-            self._zi[:, :, d] = zi_1d * x[d]
+        self._get_discrete(self._dt_nominal)
+        n = self._A_d.shape[0]
+        self._x_state = np.zeros((n, self._dim))
+        try:
+            x_ss_1d = np.linalg.solve(np.eye(n) - self._A_d, self._B_d.ravel())
+            for d in range(self._dim):
+                self._x_state[:, d] = x_ss_1d * x[d]
+        except np.linalg.LinAlgError:
+            pass
 
-    def _update_impl(self, x: np.ndarray) -> None:
+    def _update_impl(self, x: np.ndarray, dt: float) -> None:
+        self._get_discrete(dt)
+        B_flat = self._B_d.ravel()
+        D_val = self._D_d.item()
         for d in range(self._dim):
-            y, zi_new = sp_signal.sosfilt(
-                self._sos, [x[d]], zi=self._zi[:, :, d],
-            )
-            self._state[d] = y[0]
-            self._zi[:, :, d] = zi_new
+            self._x_state[:, d] = self._A_d @ self._x_state[:, d] + B_flat * x[d]
+            self._state[d] = (self._C_d @ self._x_state[:, d]).item() + D_val * x[d]
 
     def _reset_impl(self) -> None:
-        self._zi = None
+        self._dt_cached = None
+        self._x_state = None
 
 
 # ======================================================================
@@ -518,8 +669,22 @@ class OnlineFilterKalman(OnlineFilterBase):
         self._x_kal[:D] = x
         self._P = np.eye(S) * self._measurement_noise * 10.0
 
-    def _update_impl(self, x: np.ndarray) -> None:
+    def _update_impl(self, x: np.ndarray, dt: float) -> None:
         F, H, Q, R = self._F_mat, self._H_mat, self._Q_mat, self._R_mat
+
+        # For the built-in position_velocity model, rebuild F and Q with
+        # the actual elapsed time so that variable sampling periods are
+        # handled correctly.
+        if self._state_model == "position_velocity" and self._custom_F is None:
+            D = self._dim
+            F = self._F_mat.copy()
+            F[:D, D:] = np.eye(D) * dt
+            q = self._process_noise
+            Q = np.zeros((self._S_dim, self._S_dim))
+            Q[:D, :D] = np.eye(D) * (dt**4 / 4) * q
+            Q[:D, D:] = np.eye(D) * (dt**3 / 2) * q
+            Q[D:, :D] = np.eye(D) * (dt**3 / 2) * q
+            Q[D:, D:] = np.eye(D) * (dt**2) * q
 
         # Predict
         x_pred = F @ self._x_kal
