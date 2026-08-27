@@ -1,0 +1,36 @@
+# Minimal continuous MPC trajectory generator configuration.
+robot:
+  config: franka.yml
+  # Multipliers applied to the limits defined by the robot config/URDF.
+  velocity_limit_scale: 1.0
+  acceleration_limit_scale: 1.0
+  jerk_limit_scale: 1.0
+
+scene: ../scenes/reactive_desk.yml
+
+timing:
+  mpc_period_s: 0.025
+  optimization_dt_s: 0.005
+  servo_dt_s: 0.00125
+  interpolation_steps: 4
+  control_points: 24
+  deadline_s: 0.025
+
+optimizer:
+  base_config: mpc/lbfgs_mpc.yml
+  # 5000 completed the 65 s stress test. 10000 and 20000 were faster but
+  # violated jerk/acceleration constraints at 18.025 s and 6.225 s.
+  tool_pose_weight: [5000.0, 200.0]  # [position, rotation]
+  non_terminal_tool_pose_weight_factor: 0.001
+  cspace_bound_weight: [1000.0, 1000.0, 1000.0, 1000.0, 0.0]
+  squared_l2_regularization_weight: [0.01, 10000.0, 10.0, 0.0, 0.0]
+  warm_start_iterations: 200
+  cold_start_iterations: 300
+
+collision:
+  activation_distance_m: 0.06
+  self_collision_check: true
+
+runtime:
+  use_cuda_graph: true
+  random_seed: 123
