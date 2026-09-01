@@ -31,7 +31,6 @@ class PredictiveMpcTiming:
 
     mpc_period_s: float = 0.125
     interpolation_steps: int = 4
-    servo_substeps: int = 20
     optimization_dt_divisor: int = 5
 
     def __post_init__(self) -> None:
@@ -39,8 +38,6 @@ class PredictiveMpcTiming:
             raise ValueError("mpc_period_s must be finite and greater than zero")
         if self.interpolation_steps != 4:
             raise ValueError("cuRobo MPC currently requires interpolation_steps=4")
-        if self.servo_substeps < 1:
-            raise ValueError("servo_substeps must be greater than zero")
         if self.optimization_dt_divisor < 1:
             raise ValueError("optimization_dt_divisor must be greater than zero")
 
@@ -52,15 +49,15 @@ class PredictiveMpcTiming:
 
     @property
     def command_dt_s(self) -> float:
-        """Application-owned low-level servo interval."""
+        """Interval of the native MPC state commands."""
 
-        return self.mpc_period_s / self.servo_substeps
+        return self.solver_optimization_dt_s
 
     @property
     def commands_per_mpc_period(self) -> int:
-        """Number of servo samples committed by each MPC solve."""
+        """Number of native MPC states committed by each solve."""
 
-        return self.servo_substeps
+        return self.prediction_index
 
     @property
     def prediction_index(self) -> int:
@@ -73,12 +70,6 @@ class PredictiveMpcTiming:
                 "mpc_period_s must be an integer multiple of solver_optimization_dt_s"
             )
         return rounded
-
-    @property
-    def command_start_index(self) -> int:
-        """First executable state after cuRobo's B-spline support window."""
-
-        return self.interpolation_steps
 
 
 @dataclass(frozen=True)
@@ -128,6 +119,25 @@ def _finite_state(state: JointState) -> bool:
     )
 
 
+def _state_slice(state: JointState, stop: int, joint_names: list[str]) -> JointState:
+    """Clone the native MPC states before the next predicted boundary."""
+
+    if not isinstance(state.position, torch.Tensor):
+        raise TypeError("MPC state trajectory is missing position")
+    if not isinstance(state.velocity, torch.Tensor):
+        raise TypeError("MPC state trajectory is missing velocity")
+    if not isinstance(state.acceleration, torch.Tensor):
+        raise TypeError("MPC state trajectory is missing acceleration")
+    if stop < 1 or stop > state.position.shape[1]:
+        raise RuntimeError("native MPC command window is outside the returned horizon")
+    result = JointState.from_position(
+        state.position[:, :stop, :].clone(), joint_names=joint_names
+    )
+    result.velocity = state.velocity[:, :stop, :].clone()
+    result.acceleration = state.acceleration[:, :stop, :].clone()
+    return result
+
+
 def _norm_difference(first: JointState, second: JointState, field: str) -> float:
     first_value = getattr(first, field)
     second_value = getattr(second, field)
@@ -138,87 +148,14 @@ def _norm_difference(first: JointState, second: JointState, field: str) -> float
     return float(torch.linalg.vector_norm(first_value - second_value).item())
 
 
-def _quintic_window(
-    start: JointState,
-    end: JointState,
-    command_count: int,
-    period_s: float,
-    joint_names: list[str],
-) -> JointState:
-    """Interpolate q/dq/ddq boundary states over one MPC period."""
-
-    if not isinstance(start.position, torch.Tensor) or not isinstance(
-        end.position, torch.Tensor
-    ):
-        raise TypeError("quintic interpolation requires tensor positions")
-    if not isinstance(start.velocity, torch.Tensor) or not isinstance(
-        end.velocity, torch.Tensor
-    ):
-        raise TypeError("quintic interpolation requires tensor velocities")
-    if not isinstance(start.acceleration, torch.Tensor) or not isinstance(
-        end.acceleration, torch.Tensor
-    ):
-        raise TypeError("quintic interpolation requires q/dq/ddq at both boundaries")
-    q0, dq0, ddq0 = start.position, start.velocity, start.acceleration
-    q1, dq1, ddq1 = end.position, end.velocity, end.acceleration
-    period = q0.new_tensor(period_s)
-    c0 = q0
-    c1 = dq0 * period
-    c2 = 0.5 * ddq0 * period * period
-    position_residual = q1 - c0 - c1 - c2
-    velocity_residual = dq1 * period - c1 - 2.0 * c2
-    acceleration_residual = ddq1 * period * period - 2.0 * c2
-    c3 = (
-        10.0 * position_residual - 4.0 * velocity_residual + 0.5 * acceleration_residual
-    )
-    c4 = -15.0 * position_residual + 7.0 * velocity_residual - acceleration_residual
-    c5 = 6.0 * position_residual - 3.0 * velocity_residual + 0.5 * acceleration_residual
-    u = torch.arange(command_count, device=q0.device, dtype=q0.dtype)
-    u = (u / command_count).reshape(1, command_count, 1)
-    position = c0.unsqueeze(1) + u * (
-        c1.unsqueeze(1)
-        + u
-        * (
-            c2.unsqueeze(1)
-            + u * (c3.unsqueeze(1) + u * (c4.unsqueeze(1) + u * c5.unsqueeze(1)))
-        )
-    )
-    velocity = (
-        c1.unsqueeze(1)
-        + u
-        * (
-            2.0 * c2.unsqueeze(1)
-            + u
-            * (
-                3.0 * c3.unsqueeze(1)
-                + u * (4.0 * c4.unsqueeze(1) + u * 5.0 * c5.unsqueeze(1))
-            )
-        )
-    ) / period
-    acceleration = (
-        2.0 * c2.unsqueeze(1)
-        + u
-        * (
-            6.0 * c3.unsqueeze(1)
-            + u * (12.0 * c4.unsqueeze(1) + u * 20.0 * c5.unsqueeze(1))
-        )
-    ) / (period * period)
-    result = JointState.from_position(position, joint_names=joint_names)
-    result.velocity = velocity
-    result.acceleration = acceleration
-    return result
-
-
 class PredictedStateMpc:
     """Solve from the state predicted one MPC period by the previous result.
 
     Each solve's ``prediction_index`` is exactly one MPC period after its input.
-    It supplies the next q/dq/ddq waypoint and the next solve input. A quintic
-    segment connects consecutive waypoints at the independent servo rate,
-    keeping q/dq/ddq continuous without directly stitching cuRobo's offset
-    public command windows. The class contains no simulation or I/O; a real
-    system can run :meth:`step` in a planning worker and atomically publish each
-    cloned :class:`MpcCommandWindow` to an independent servo thread.
+    It supplies the next q/dq/ddq solve input and directly commits the preceding
+    native states from cuRobo's full rollout. The class contains no simulation or
+    I/O; a real system can run :meth:`step` in a planning worker and atomically
+    publish each cloned :class:`MpcCommandWindow` to a command consumer.
     """
 
     def __init__(self, solver: MpcSolver, timing: PredictiveMpcTiming) -> None:
@@ -271,16 +208,11 @@ class PredictedStateMpc:
             self._current_state, rollout_initial, "acceleration"
         )
 
-        count = self.timing.commands_per_mpc_period
         next_current = _state_at(
             full_state, self.timing.prediction_index, self.solver.joint_names
         )
-        commands = _quintic_window(
-            self._current_state,
-            next_current,
-            count,
-            self.timing.mpc_period_s,
-            self.solver.joint_names,
+        commands = _state_slice(
+            full_state, self.timing.prediction_index, self.solver.joint_names
         )
         boundary = next_current.clone()
 

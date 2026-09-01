@@ -50,6 +50,21 @@ filt.update_chunk(t[:50], x[:50])      # add a whole chunk
 output = filt.get_output(t=0.25)       # query from another thread
 ```
 
+## Minimal continuous cuRobo MPC example
+
+From this repository directory, generate a feedforward trajectory whose relative
+Cartesian target changes periodically:
+
+```bash
+../curobo/.venv/bin/python continuous_mpc_example.py
+```
+
+The command writes `artifacts/continuous_mpc_minimal/trajectory.csv` with joint
+position, velocity, acceleration, and finite-difference jerk, plus `summary.json`
+with their per-joint maxima. Commands are cuRobo's native full-rollout states at
+`optimization_dt`; no application-side trajectory interpolation is used. All timing,
+target, constraint, and cost values are in `python_filter_smoothing/configs/continuous_mpc.yml`.
+
 ---
 
 ## Filter Types

@@ -11,7 +11,6 @@ scene: ../scenes/reactive_desk.yml
 timing:
   mpc_period_s: 0.025
   optimization_dt_s: 0.005
-  servo_dt_s: 0.00125
   interpolation_steps: 4
   control_points: 24
   deadline_s: 0.025
@@ -34,3 +33,13 @@ collision:
 runtime:
   use_cuda_graph: true
   random_seed: 123
+
+example:
+  duration_s: 2.0
+  target_period_s: 0.5
+  target_offsets_m:
+    - [0.02, 0.00, 0.00]
+    - [0.00, 0.02, 0.01]
+    - [-0.02, 0.00, 0.00]
+    - [0.00, -0.02, 0.01]
+  output_directory: ../../artifacts/continuous_mpc_minimal

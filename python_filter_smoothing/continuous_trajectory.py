@@ -15,7 +15,7 @@ from curobo.model_predictive_control import (
 )
 from curobo.types import GoalToolPose, JointState
 
-from mpc_app.predictive_mpc import (
+from .predictive_mpc import (
     MpcCommandWindow,
     PredictedStateMpc,
     PredictiveMpcTiming,
@@ -84,17 +84,12 @@ class ContinuousMpcTrajectory:
         timing = self.config["timing"]
         mpc_period = float(timing["mpc_period_s"])
         optimization_dt = float(timing["optimization_dt_s"])
-        servo_dt = float(timing["servo_dt_s"])
         optimization_divisor = round(mpc_period / optimization_dt)
-        servo_substeps = round(mpc_period / servo_dt)
         if not math.isclose(mpc_period / optimization_divisor, optimization_dt):
             raise ValueError("optimization_dt_s must divide mpc_period_s")
-        if not math.isclose(mpc_period / servo_substeps, servo_dt):
-            raise ValueError("servo_dt_s must divide mpc_period_s")
         self.timing = PredictiveMpcTiming(
             mpc_period_s=mpc_period,
             interpolation_steps=int(timing["interpolation_steps"]),
-            servo_substeps=servo_substeps,
             optimization_dt_divisor=optimization_divisor,
         )
         self.deadline_s = float(timing["deadline_s"])
