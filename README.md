@@ -64,6 +64,16 @@ position, velocity, acceleration, and finite-difference jerk, plus `summary.json
 with their per-joint maxima. Commands are cuRobo's native full-rollout states at
 `optimization_dt`; no application-side trajectory interpolation is used. All timing,
 target, constraint, and cost values are in `python_filter_smoothing/configs/continuous_mpc.yml`.
+Robot, scene, and optimizer-base entries may be absolute paths, paths relative to
+that YAML, or names of configurations bundled with cuRobo. The tracked profile is a
+generic runnable example; machine- or mechanism-specific profiles belong under the
+ignored `local/` directory.
+
+Cartesian targets may also contain `target_rotation_offsets_rot6d`. The example uses
+the Zhou 6D convention (first rotation-matrix column followed by the second), projects
+it to SO(3), composes it with the initial tool orientation, and passes a wxyz quaternion
+to cuRobo. A single six-value row is broadcast to every position target. Rot6D is useful
+at learned-model inputs; quaternion remains the MPC/API boundary representation.
 
 ---
 

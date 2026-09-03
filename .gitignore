@@ -211,3 +211,11 @@ uv.lock
 investigation/
 plan/
 artifacts/
+
+# Local MPC experiments and generated analysis output
+/local/
+/analysis/
+/reports/
+/*_REPORT.md
+/analyze_continuous_mpc.py
+/plot_continuous_mpc.py

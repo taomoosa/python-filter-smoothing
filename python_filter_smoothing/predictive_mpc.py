@@ -29,45 +29,36 @@ class MpcSolver(Protocol):
 class PredictiveMpcTiming:
     """Timing contract for one MPC producer and a faster servo consumer."""
 
-    mpc_period_s: float = 0.125
-    interpolation_steps: int = 4
-    optimization_dt_divisor: int = 5
+    mpc_period_s: float
+    optimization_dt_s: float
+    interpolation_steps: int
+    required_feasible_windows: int
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.mpc_period_s) or self.mpc_period_s <= 0.0:
             raise ValueError("mpc_period_s must be finite and greater than zero")
+        if not math.isfinite(self.optimization_dt_s) or self.optimization_dt_s <= 0.0:
+            raise ValueError("optimization_dt_s must be finite and greater than zero")
         if self.interpolation_steps != 4:
             raise ValueError("cuRobo MPC currently requires interpolation_steps=4")
-        if self.optimization_dt_divisor < 1:
-            raise ValueError("optimization_dt_divisor must be greater than zero")
-
-    @property
-    def solver_optimization_dt_s(self) -> float:
-        """Value passed to cuRobo's current ``optimization_dt`` implementation."""
-
-        return self.mpc_period_s / self.optimization_dt_divisor
+        if self.required_feasible_windows < 1:
+            raise ValueError("required_feasible_windows must be at least one")
 
     @property
     def command_dt_s(self) -> float:
         """Interval of the native MPC state commands."""
 
-        return self.solver_optimization_dt_s
-
-    @property
-    def commands_per_mpc_period(self) -> int:
-        """Number of native MPC states committed by each solve."""
-
-        return self.prediction_index
+        return self.optimization_dt_s
 
     @property
     def prediction_index(self) -> int:
         """Full-state index exactly one MPC period after the solve input."""
 
-        ratio = self.mpc_period_s / self.solver_optimization_dt_s
+        ratio = self.mpc_period_s / self.optimization_dt_s
         rounded = round(ratio)
         if rounded < 1 or not math.isclose(ratio, rounded, rel_tol=1.0e-9):
             raise ValueError(
-                "mpc_period_s must be an integer multiple of solver_optimization_dt_s"
+                "mpc_period_s must be an integer multiple of optimization_dt_s"
             )
         return rounded
 
@@ -87,6 +78,18 @@ class MpcCommandWindow:
     position_boundary_error_rad: float | None
     velocity_boundary_error_rad_s: float | None
     acceleration_boundary_error_rad_s2: float | None
+    full_horizon_feasible: bool
+    used_feasible_tail_fallback: bool
+    rejected_by_command_limits: bool
+
+
+@dataclass(frozen=True)
+class MpcCommandLimits:
+    """Per-joint limits used to reject unsafe optimizer solutions."""
+
+    velocity: torch.Tensor
+    acceleration: torch.Tensor
+    jerk: torch.Tensor
 
 
 def _state_at(state: JointState, index: int, joint_names: list[str]) -> JointState:
@@ -119,7 +122,9 @@ def _finite_state(state: JointState) -> bool:
     )
 
 
-def _state_slice(state: JointState, stop: int, joint_names: list[str]) -> JointState:
+def _state_slice(
+    state: JointState, start: int, stop: int, joint_names: list[str]
+) -> JointState:
     """Clone the native MPC states before the next predicted boundary."""
 
     if not isinstance(state.position, torch.Tensor):
@@ -128,13 +133,13 @@ def _state_slice(state: JointState, stop: int, joint_names: list[str]) -> JointS
         raise TypeError("MPC state trajectory is missing velocity")
     if not isinstance(state.acceleration, torch.Tensor):
         raise TypeError("MPC state trajectory is missing acceleration")
-    if stop < 1 or stop > state.position.shape[1]:
+    if start < 0 or stop <= start or stop > state.position.shape[1]:
         raise RuntimeError("native MPC command window is outside the returned horizon")
     result = JointState.from_position(
-        state.position[:, :stop, :].clone(), joint_names=joint_names
+        state.position[:, start:stop, :].clone(), joint_names=joint_names
     )
-    result.velocity = state.velocity[:, :stop, :].clone()
-    result.acceleration = state.acceleration[:, :stop, :].clone()
+    result.velocity = state.velocity[:, start:stop, :].clone()
+    result.acceleration = state.acceleration[:, start:stop, :].clone()
     return result
 
 
@@ -148,6 +153,52 @@ def _norm_difference(first: JointState, second: JointState, field: str) -> float
     return float(torch.linalg.vector_norm(first_value - second_value).item())
 
 
+def _feasible_prefix_length(solver: MpcSolver) -> int:
+    """Count consecutive constraint-feasible states from the horizon start."""
+
+    manager = getattr(solver, "trajectory_execution_manager", None)
+    if manager is None or not hasattr(manager, "get_current_metrics"):
+        return 0
+    feasible = manager.get_current_metrics().feasible
+    if not isinstance(feasible, torch.Tensor) or feasible.ndim < 2:
+        return 0
+    by_state = torch.all(feasible.reshape(-1, feasible.shape[-1]), dim=0)
+    first_failure = torch.nonzero(~by_state, as_tuple=False)
+    return int(first_failure[0, 0].item()) if len(first_failure) else len(by_state)
+
+
+def _within_command_limits(
+    state: JointState,
+    initial_state: JointState,
+    dt_s: float,
+    limits: MpcCommandLimits,
+) -> bool:
+    """Check the full candidate horizon before it can become a fallback tail."""
+
+    if not _finite_state(state):
+        return False
+    velocity = state.velocity
+    acceleration = state.acceleration
+    initial_acceleration = initial_state.acceleration
+    if not isinstance(velocity, torch.Tensor) or not isinstance(
+        acceleration, torch.Tensor
+    ):
+        return False
+    if not isinstance(initial_acceleration, torch.Tensor):
+        return False
+    jerk = (
+        torch.diff(
+            torch.cat((initial_acceleration[:, None, :], acceleration), dim=1), dim=1
+        )
+        / dt_s
+    )
+    return bool(
+        torch.all(velocity.abs() <= limits.velocity).item()
+        and torch.all(acceleration.abs() <= limits.acceleration).item()
+        and torch.all(jerk.abs() <= limits.jerk).item()
+    )
+
+
 class PredictedStateMpc:
     """Solve from the state predicted one MPC period by the previous result.
 
@@ -158,11 +209,20 @@ class PredictedStateMpc:
     publish each cloned :class:`MpcCommandWindow` to a command consumer.
     """
 
-    def __init__(self, solver: MpcSolver, timing: PredictiveMpcTiming) -> None:
+    def __init__(
+        self,
+        solver: MpcSolver,
+        timing: PredictiveMpcTiming,
+        command_limits: MpcCommandLimits | None = None,
+    ) -> None:
         self.solver = solver
         self.timing = timing
+        self.command_limits = command_limits
         self._current_state: JointState | None = None
         self._previous_boundary: JointState | None = None
+        self._feasible_tail: JointState | None = None
+        self._feasible_tail_start = 0
+        self._feasible_tail_stop = 0
 
     @property
     def current_state(self) -> JointState:
@@ -179,6 +239,9 @@ class PredictedStateMpc:
             raise ValueError("initial_state q/dq/ddq must be finite")
         self._current_state = initial_state.clone()
         self._previous_boundary = None
+        self._feasible_tail = None
+        self._feasible_tail_start = 0
+        self._feasible_tail_stop = 0
         self.solver.setup(self._current_state)
 
     def step(self) -> MpcCommandWindow:
@@ -189,15 +252,60 @@ class PredictedStateMpc:
         started = time.perf_counter()
         result = self.solver.optimize_action_sequence(self._current_state)
         wall_time_s = time.perf_counter() - started
-        if result.success is None or not bool(torch.all(result.success).item()):
+        full_horizon_feasible = result.success is not None and bool(
+            torch.all(result.success).item()
+        )
+        prefix_stop = self.timing.prediction_index + 1
+        feasible_prefix_length = _feasible_prefix_length(self.solver)
+        prefix_feasible = feasible_prefix_length >= prefix_stop
+        used_fallback = False
+        state_start = 0
+        full_state = (
+            result.robot_state_sequence.joint_state
+            if result.robot_state_sequence is not None
+            else None
+        )
+        rejected_by_command_limits = bool(
+            full_state is not None
+            and self.command_limits is not None
+            and not _within_command_limits(
+                full_state,
+                self._current_state,
+                self.timing.command_dt_s,
+                self.command_limits,
+            )
+        )
+        if rejected_by_command_limits:
+            full_horizon_feasible = False
+            prefix_feasible = False
+        fallback_stop = self._feasible_tail_start + self.timing.prediction_index
+        has_fallback_window = (
+            self._feasible_tail is not None and fallback_stop < self._feasible_tail_stop
+        )
+        has_safe_backup = (
+            not rejected_by_command_limits
+            and feasible_prefix_length
+            >= self.timing.required_feasible_windows * self.timing.prediction_index + 1
+        )
+        candidate_usable = full_horizon_feasible or prefix_feasible
+        if (
+            not full_horizon_feasible
+            and not has_safe_backup
+            and has_fallback_window
+            and self._feasible_tail is not None
+        ):
+            full_state = self._feasible_tail
+            state_start = self._feasible_tail_start
+            self._feasible_tail_start = fallback_stop
+            used_fallback = True
+        if full_state is None or (
+            not full_horizon_feasible and not used_fallback and not prefix_feasible
+        ):
             raise RuntimeError("MPC returned an infeasible result")
-        if result.robot_state_sequence is None:
-            raise RuntimeError("MPC did not return robot_state_sequence")
-        full_state = result.robot_state_sequence.joint_state
         if not _finite_state(full_state):
             raise RuntimeError("MPC returned non-finite q/dq/ddq")
 
-        rollout_initial = _state_at(full_state, 0, self.solver.joint_names)
+        rollout_initial = _state_at(full_state, state_start, self.solver.joint_names)
         initial_position_error = _norm_difference(
             self._current_state, rollout_initial, "position"
         )
@@ -209,10 +317,15 @@ class PredictedStateMpc:
         )
 
         next_current = _state_at(
-            full_state, self.timing.prediction_index, self.solver.joint_names
+            full_state,
+            state_start + self.timing.prediction_index,
+            self.solver.joint_names,
         )
         commands = _state_slice(
-            full_state, self.timing.prediction_index, self.solver.joint_names
+            full_state,
+            state_start,
+            state_start + self.timing.prediction_index,
+            self.solver.joint_names,
         )
         boundary = next_current.clone()
 
@@ -231,6 +344,18 @@ class PredictedStateMpc:
 
         self._current_state = next_current.clone()
         self._previous_boundary = boundary.clone()
+        if not used_fallback and candidate_usable:
+            self._feasible_tail = full_state.clone()
+            self._feasible_tail_start = self.timing.prediction_index
+            self._feasible_tail_stop = (
+                full_state.position.shape[1]
+                if full_horizon_feasible
+                else feasible_prefix_length
+            )
+        elif not used_fallback:
+            self._feasible_tail = None
+        if used_fallback and hasattr(self.solver, "reset_robot"):
+            self.solver.reset_robot(self._current_state)
         return MpcCommandWindow(
             commands=commands,
             next_current_state=next_current,
@@ -243,4 +368,7 @@ class PredictedStateMpc:
             position_boundary_error_rad=position_error,
             velocity_boundary_error_rad_s=velocity_error,
             acceleration_boundary_error_rad_s2=acceleration_error,
+            full_horizon_feasible=full_horizon_feasible,
+            used_feasible_tail_fallback=used_fallback,
+            rejected_by_command_limits=rejected_by_command_limits,
         )
