@@ -17,7 +17,7 @@ uv pip install -e ".[dev]"
 uv pip install -e ".[viz]"
 
 # Everything
-uv pip install -e ".[dev,viz]"
+uv pip install -e ".[dev,viz,mpc]"
 ```
 
 ## Quick Start
@@ -50,30 +50,63 @@ filt.update_chunk(t[:50], x[:50])      # add a whole chunk
 output = filt.get_output(t=0.25)       # query from another thread
 ```
 
-## Minimal continuous cuRobo MPC example
+## Long-horizon cuRobo MPC application
 
-From this repository directory, generate a feedforward trajectory whose relative
-Cartesian target changes periodically:
+The maintained MPC example generates a long collision-aware cuRobo path and
+resamples it to 5 ms servo commands. Time-scaled cubic Hermite is the standard;
+state-to-state Ruckig remains selectable with `resampling.method: ruckig` in
+`python_filter_smoothing/configs/long_mpc_application.yml`.
+It requires a CUDA-enabled cuRobo installation; the commands below assume its
+virtual environment is in the sibling `../curobo` checkout.
 
 ```bash
-../curobo/.venv/bin/python continuous_mpc_example.py
+../curobo/.venv/bin/python long_mpc_example.py --duration 65
+
+# Viser playback (open http://localhost:8080)
+../curobo/.venv/bin/python visualize_mpc_trajectory.py \
+  artifacts/long_mpc \
+  --mpc-config python_filter_smoothing/configs/long_mpc.yml
 ```
 
-The command writes `artifacts/continuous_mpc_minimal/trajectory.csv` with joint
-position, velocity, acceleration, and finite-difference jerk, plus `summary.json`
-with their per-joint maxima. Commands are cuRobo's native full-rollout states at
-`optimization_dt`; no application-side trajectory interpolation is used. All timing,
-target, constraint, and cost values are in `python_filter_smoothing/configs/continuous_mpc.yml`.
-Robot, scene, and optimizer-base entries may be absolute paths, paths relative to
-that YAML, or names of configurations bundled with cuRobo. The tracked profile is a
-generic runnable example; machine- or mechanism-specific profiles belong under the
-ignored `local/` directory.
+`ContinuousMpcTrajectory.solve_horizon()` only returns a complete cuRobo
+`q/dq/ddq` rollout. For each Cartesian target, the adapter first solves IK from
+the connection state, installs the result as the joint reference and optimizer
+seed, and falls back to several global IK seeds when needed. The iteration counts
+in `optimizer.target_update.candidate_iterations` are independent cold solves.
+The application archives every feasible result and ranks feasible candidates by
+terminal pose error; a later infeasible solve therefore cannot erase an earlier
+safe result.
 
-Cartesian targets may also contain `target_rotation_offsets_rot6d`. The example uses
-the Zhou 6D convention (first rotation-matrix column followed by the second), projects
-it to SO(3), composes it with the initial tool orientation, and passes a wxyz quaternion
-to cuRobo. A single six-value row is broadcast to every position target. Rot6D is useful
-at learned-model inputs; quaternion remains the MPC/API boundary representation.
+Selection, resampling, final validation, and queue ownership remain in the
+application. The synchronous example plans from the state already queued at the
+configured future connection time. The old verified queue continues during
+calculation; a new path is published only if it arrives before that boundary,
+respects derivative limits, and passes cspace, self-collision, and scene-collision
+checks at every 5 ms output point. If IK, every MPC candidate, post-processing, or
+the deadline fails, the queue is left untouched. A stationary terminal state may
+be held after queue exhaustion, but a moving terminal state is never extended.
+
+Both resamplers use the same short centered Savitzky–Golay position filter, restore
+the first and last `q/dq/ddq`, and pass through the same final validation. The filter
+uses future samples from an already planned trajectory, so it adds no phase shift to
+offline queue generation; it would require explicit buffering in a causal streaming
+implementation. Discrete 5 ms collision checks do not constitute a continuous swept
+collision proof.
+
+Optimizer execution policy is explicit in `long_mpc.yml`. Setup uses
+`optimizer.cold_start_iterations`; target updates use
+`target_update.candidate_iterations`, `use_ik_joint_reference`, `seed_from_ik`,
+and `ik_fallback_seeds`. Each independent solve resets the old optimizer cache
+after the target change. `fixed_iterations` and `return_best_action` map directly
+to the cuRobo optimizer configuration. The synchronous example is an asynchronous
+planner/servo model: production code should run the same producer in a worker and
+let the servo loop consume the verified queue without waiting.
+
+Targets accept XYZ offsets and Zhou 6D rotation offsets (first two rotation-matrix
+columns). The adapter projects rot6D to SO(3), composes it with the initial tool
+orientation, and passes a wxyz quaternion to cuRobo. Machine- or mechanism-specific
+profiles and large benchmark artifacts belong under the ignored `local/` and
+`artifacts/` directories.
 
 ---
 

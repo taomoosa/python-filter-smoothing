@@ -21,10 +21,16 @@ dev = [
 viz = [
     "rerun-sdk",
 ]
+mpc = [
+    "ruckig>=0.19",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["python_filter_smoothing*"]
+
+[tool.setuptools.package-data]
+python_filter_smoothing = ["configs/*.yml", "scenes/*.yml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

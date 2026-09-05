@@ -1,0 +1,36 @@
+# Long collision-aware MPC followed by a selectable 5 ms trajectory resampler.
+long_mpc_config: long_mpc.yml
+
+example:
+  duration_s: 8.0
+  target_period_s: 4.0
+  servo_dt_s: 0.005
+  # Five independent candidates took about 194 ms at the measured median.
+  planning_connection_delay_s: 0.250
+  target_offsets_m:
+    - [0.000, 0.100, 0.000]
+    - [0.000, -0.100, 0.020]
+  target_rotation_offsets_rot6d:
+    - [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    - [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+  output_directory: ../../artifacts/long_mpc
+
+resampling:
+  # hermite is the standard path. ruckig is retained as a selectable alternative.
+  method: hermite
+  velocity_limit_scale: 1.0
+  acceleration_limit_scale: 1.0
+  jerk_limit_scale: 1.0
+  hermite:
+    initial_time_scale: 1.0
+    time_scale_margin: 1.02
+    max_time_scale_iterations: 8
+  ruckig:
+    limit_margin: 1.0
+    time_scale_margin: 1.02
+    max_time_scale_iterations: 12
+  post_filter:
+    method: savgol_position
+    # 9 samples x 5 ms = 45 ms spans two 20 ms long-MPC intervals.
+    window_length_samples: 9
+    polynomial_order: 2

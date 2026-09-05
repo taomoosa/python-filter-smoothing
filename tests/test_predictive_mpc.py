@@ -7,146 +7,172 @@ import pytest
 import torch
 from curobo.types import JointState
 
+from python_filter_smoothing.continuous_trajectory import (
+    ContinuousMpcTrajectory,
+    _iteration_sequence,
+    _positive_iterations,
+)
 from python_filter_smoothing.predictive_mpc import (
     MpcCommandLimits,
-    PredictedStateMpc,
-    PredictiveMpcTiming,
+    MpcHorizonProducer,
+    MpcTiming,
 )
 
 
-class _Solver:
-    joint_names: ClassVar[list[str]] = ["j1"]
-
-    def __init__(self, feasible: torch.Tensor) -> None:
-        metrics = SimpleNamespace(feasible=feasible)
-        self.trajectory_execution_manager = SimpleNamespace(
-            get_current_metrics=lambda: metrics
-        )
-
-    def setup(self, current_state: JointState) -> None:
-        pass
-
-    def optimize_action_sequence(self, current_state: JointState) -> SimpleNamespace:
-        position = current_state.position[:, None, :].expand(1, 12, 1).clone()
-        full = JointState.from_position(position, joint_names=self.joint_names)
-        full.velocity = torch.zeros_like(position)
-        full.acceleration = torch.zeros_like(position)
-        return SimpleNamespace(
-            success=torch.tensor([False]),
-            robot_state_sequence=SimpleNamespace(joint_state=full),
-            solve_time=0.001,
-        )
-
-
-def _state() -> JointState:
-    state = JointState.from_position(torch.zeros(1, 1), joint_names=["j1"])
+def _state(value: float = 0.0) -> JointState:
+    state = JointState.from_position(torch.tensor([[value]]), joint_names=["j1"])
     state.velocity = torch.zeros_like(state.position)
     state.acceleration = torch.zeros_like(state.position)
     return state
 
 
-def _timing() -> PredictiveMpcTiming:
-    return PredictiveMpcTiming(
-        mpc_period_s=0.125,
-        optimization_dt_s=0.025,
-        interpolation_steps=4,
-        required_feasible_windows=4,
+class _Solver:
+    joint_names: ClassVar[list[str]] = ["j1"]
+
+    def __init__(self, success: bool, acceleration: float = 0.0) -> None:
+        self.success = success
+        self.acceleration = acceleration
+        metrics = SimpleNamespace(feasible=torch.tensor([[True] * 6 + [False] * 6]))
+        self.trajectory_execution_manager = SimpleNamespace(
+            get_current_metrics=lambda: metrics
+        )
+
+    def setup(self, current_state: JointState) -> None:
+        self.setup_state = current_state.clone()
+
+    def optimize_action_sequence(self, current_state: JointState) -> SimpleNamespace:
+        position = current_state.position[:, None, :].expand(1, 12, 1).clone()
+        full = JointState.from_position(position, joint_names=self.joint_names)
+        full.velocity = torch.zeros_like(position)
+        full.acceleration = torch.full_like(position, self.acceleration)
+        return SimpleNamespace(
+            success=torch.tensor([self.success]),
+            robot_state_sequence=SimpleNamespace(joint_state=full),
+            solve_time=0.001,
+        )
+
+
+def _producer(solver: _Solver) -> MpcHorizonProducer:
+    ones = torch.ones(1)
+    return MpcHorizonProducer(
+        solver,
+        MpcTiming(optimization_dt_s=0.02, interpolation_steps=4),
+        MpcCommandLimits(ones, ones, ones),
     )
 
 
-def test_accepts_feasible_executable_prefix_when_future_horizon_is_infeasible() -> None:
-    feasible = torch.tensor([[True] * 6 + [False] * 6])
-    planner = PredictedStateMpc(_Solver(feasible), _timing())
-    planner.setup(_state())
-
-    window = planner.step()
-
-    assert not window.full_horizon_feasible
-    assert window.commands.position.shape[1] == 5
+@pytest.mark.parametrize("value", [0, -1, 1.5, True])
+def test_optimizer_iterations_must_be_positive_integers(value: object) -> None:
+    with pytest.raises((TypeError, ValueError), match="positive integer"):
+        _positive_iterations(value, "optimizer.test_iterations")
 
 
-def test_rejects_infeasible_executable_prefix() -> None:
-    feasible = torch.tensor([[True] * 5 + [False] * 7])
-    planner = PredictedStateMpc(_Solver(feasible), _timing())
-    planner.setup(_state())
-
-    with pytest.raises(RuntimeError, match="infeasible"):
-        planner.step()
+@pytest.mark.parametrize("value", [[], [100, 50], [50, 50]])
+def test_candidate_iterations_must_be_increasing(value: list[int]) -> None:
+    with pytest.raises(ValueError, match="strictly increasing|nonempty"):
+        _iteration_sequence(value, "optimizer.candidates")
 
 
-def test_uses_previous_feasible_tail_when_next_solve_is_infeasible() -> None:
-    class SequenceSolver(_Solver):
+def test_target_update_prepares_first_independent_candidate() -> None:
+    class TargetSolver:
         def __init__(self) -> None:
-            super().__init__(torch.tensor([[False] * 12]))
-            self.calls = 0
+            self.config = SimpleNamespace(cold_start_optimization_num_iters=300)
+            self.reset_states: list[JointState] = []
 
-        def optimize_action_sequence(
-            self, current_state: JointState
-        ) -> SimpleNamespace:
-            index = torch.arange(12, dtype=torch.float32).reshape(1, 12, 1)
-            position = current_state.position[:, None, :] + index
-            if self.calls:
-                position += 100.0
-            full = JointState.from_position(position, joint_names=self.joint_names)
-            full.velocity = torch.zeros_like(position)
-            full.acceleration = torch.zeros_like(position)
-            success = torch.tensor([self.calls == 0])
-            self.calls += 1
-            return SimpleNamespace(
-                success=success,
-                robot_state_sequence=SimpleNamespace(joint_state=full),
-                solve_time=0.001,
-            )
+        def update_goal_tool_poses(self, goal: object, *, run_ik: bool) -> bool:
+            assert not run_ik
+            return True
 
-        def reset_robot(self, current_state: JointState) -> None:
-            pass
+        def reset_robot(self, state: JointState) -> None:
+            self.reset_states.append(state.clone())
 
-    planner = PredictedStateMpc(SequenceSolver(), _timing())
-    planner.setup(_state())
+    solver = TargetSolver()
+    application = ContinuousMpcTrajectory.__new__(ContinuousMpcTrajectory)
+    application.solver = solver
+    application._planner = SimpleNamespace(current_state=_state())
+    application._goal_request = SimpleNamespace(
+        position=torch.zeros((1, 1, 1, 1, 3)),
+        quaternion=torch.zeros((1, 1, 1, 1, 4)),
+    )
+    application._candidate_iterations = (50, 100, 200)
+    application._use_ik_joint_reference = False
+    application._seed_from_ik = False
+    application._joint_reference_state = None
 
-    planner.step()
-    fallback = planner.step()
+    application.set_target(
+        torch.tensor([0.1, 0.2, 0.3]), torch.tensor([1.0, 0.0, 0.0, 0.0])
+    )
 
-    assert fallback.used_feasible_tail_fallback
-    assert fallback.commands.position[0, 0, 0].item() == pytest.approx(5.0)
-    assert fallback.next_current_state.position[0, 0].item() == pytest.approx(10.0)
+    assert solver.config.cold_start_optimization_num_iters == 50
+    assert len(solver.reset_states) == 1
+    assert application._goal_request.position.flatten().tolist() == pytest.approx(
+        [0.1, 0.2, 0.3]
+    )
+
+
+def test_candidate_reset_reapplies_joint_reference_and_seed() -> None:
+    class TargetSolver:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(cold_start_optimization_num_iters=50)
+            self.calls: list[str] = []
+
+        def reset_robot(self, state: JointState) -> None:
+            self.calls.append("reset")
+
+        def update_goal_state(self, state: JointState) -> None:
+            self.calls.append("goal")
+
+        def enable_joint_position_tracking(self) -> None:
+            self.calls.append("track")
+
+        def update_seed_trajectory_from_goal_state(self, state: JointState) -> None:
+            self.calls.append("seed")
+
+    solver = TargetSolver()
+    application = ContinuousMpcTrajectory.__new__(ContinuousMpcTrajectory)
+    application.solver = solver
+    application._joint_reference_state = _state(0.5)
+    application._seed_from_ik = True
+
+    application.prepare_candidate(_state(), 200)
+
+    assert solver.config.cold_start_optimization_num_iters == 200
+    assert solver.calls == ["reset", "goal", "track", "seed"]
+
+
+def test_exposes_complete_infeasible_horizon_without_advancing_state() -> None:
+    producer = _producer(_Solver(success=False))
+    producer.setup(_state())
+
+    horizon = producer.solve_horizon()
+
+    assert not horizon.full_horizon_feasible
+    assert horizon.feasible_prefix_length == 6
+    assert horizon.states.position.shape[1] == 12
+    assert producer.current_state.position.item() == pytest.approx(0.0)
+
+
+def test_successful_horizon_is_exposed_without_advancing_state() -> None:
+    producer = _producer(_Solver(success=True))
+    producer.setup(_state(0.2))
+
+    horizon = producer.solve_horizon()
+
+    assert horizon.full_horizon_feasible
+    assert not horizon.rejected_by_command_limits
+    assert producer.current_state.position.item() == pytest.approx(0.2)
 
 
 def test_rejects_successful_solution_outside_command_limits() -> None:
-    class SequenceSolver(_Solver):
-        def __init__(self) -> None:
-            super().__init__(torch.tensor([[True] * 12]))
-            self.calls = 0
+    producer = _producer(_Solver(success=True, acceleration=2.0))
+    producer.setup(_state())
 
-        def optimize_action_sequence(
-            self, current_state: JointState
-        ) -> SimpleNamespace:
-            position = current_state.position[:, None, :].expand(1, 12, 1).clone()
-            full = JointState.from_position(position, joint_names=self.joint_names)
-            full.velocity = torch.zeros_like(position)
-            full.acceleration = torch.zeros_like(position)
-            if self.calls:
-                full.acceleration.fill_(2.0)
-            self.calls += 1
-            return SimpleNamespace(
-                success=torch.tensor([True]),
-                robot_state_sequence=SimpleNamespace(joint_state=full),
-                solve_time=0.001,
-            )
+    horizon = producer.solve_horizon()
 
-        def reset_robot(self, current_state: JointState) -> None:
-            pass
+    assert not horizon.full_horizon_feasible
+    assert horizon.rejected_by_command_limits
 
-    limit = torch.ones(1)
-    planner = PredictedStateMpc(
-        SequenceSolver(),
-        _timing(),
-        MpcCommandLimits(limit, limit, limit),
-    )
-    planner.setup(_state())
 
-    planner.step()
-    fallback = planner.step()
-
-    assert fallback.rejected_by_command_limits
-    assert fallback.used_feasible_tail_fallback
+def test_timing_requires_curobo_interpolation_setting() -> None:
+    with pytest.raises(ValueError, match="interpolation_steps=4"):
+        MpcTiming(optimization_dt_s=0.02, interpolation_steps=2)
