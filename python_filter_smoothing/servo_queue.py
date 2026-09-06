@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from curobo.types import JointState
 
@@ -58,23 +60,68 @@ def extend_stationary_trajectory(state: JointState, samples: int) -> JointState:
     return result
 
 
+def concatenate_joint_trajectories(first: JointState, second: JointState) -> JointState:
+    """Join two sampled trajectories without changing either input."""
+
+    result = JointState.from_position(
+        torch.cat((first.position, second.position), dim=1),
+        joint_names=first.joint_names,
+    )
+    for field in ("velocity", "acceleration", "jerk"):
+        first_value = getattr(first, field)
+        second_value = getattr(second, field)
+        if isinstance(first_value, torch.Tensor) and isinstance(
+            second_value, torch.Tensor
+        ):
+            setattr(result, field, torch.cat((first_value, second_value), dim=1))
+    result.dt = second.dt if second.dt is not None else first.dt
+    return result
+
+
+@dataclass(frozen=True)
+class ServoPlanTicket:
+    """Snapshot identifying the future state used to initialize one plan."""
+
+    initial_state: JointState
+    splice_sample: int
+    queue_revision: int
+
+
+@dataclass(frozen=True)
+class ServoPlanCommit:
+    """Result of atomically replacing a future queue suffix."""
+
+    accepted: bool
+    reason: str
+    samples_until_splice: int
+    continuity_errors: tuple[float, float, float] | None = None
+
+
 class ServoTrajectoryQueue:
     """Consume a verified trajectory while a new one is being generated."""
 
     def __init__(self, state: JointState) -> None:
         self._state = state.clone()
         self._head = 0
+        self._consumed_samples = 0
+        self._revision = 0
 
     @property
     def remaining_samples(self) -> int:
         return self._state.position.shape[1] - self._head
 
+    @property
+    def consumed_samples(self) -> int:
+        return self._consumed_samples
+
+    @property
+    def current_state(self) -> JointState:
+        return self.at_offset(0)
+
     def at_offset(self, offset: int) -> JointState:
         if offset < 0:
             raise ValueError("queue offset must be nonnegative")
-        self._state = extend_stationary_trajectory(
-            self._state, self._head + offset + 1
-        )
+        self._state = extend_stationary_trajectory(self._state, self._head + offset + 1)
         return single_joint_state(self._state, self._head + offset)
 
     def consume(self, samples: int) -> JointState:
@@ -83,20 +130,52 @@ class ServoTrajectoryQueue:
         self._state = extend_stationary_trajectory(
             self._state, self._head + samples + 1
         )
-        result = slice_joint_trajectory(
-            self._state, self._head, self._head + samples
-        )
+        result = slice_joint_trajectory(self._state, self._head, self._head + samples)
         self._head += samples
+        self._consumed_samples += samples
         return result
 
-    def replace(self, state: JointState, tolerance: float = 2.0e-5) -> None:
-        current = self.at_offset(0)
+    def begin_plan(self, samples_until_splice: int) -> ServoPlanTicket:
+        """Reserve a future connection point and return its q/dq/ddq state."""
+
+        if samples_until_splice < 0:
+            raise ValueError("samples_until_splice must be nonnegative")
+        return ServoPlanTicket(
+            initial_state=self.at_offset(samples_until_splice),
+            splice_sample=self._consumed_samples + samples_until_splice,
+            queue_revision=self._revision,
+        )
+
+    def commit_plan(
+        self,
+        ticket: ServoPlanTicket,
+        state: JointState,
+        tolerance: float = 2.0e-5,
+    ) -> ServoPlanCommit:
+        """Replace the suffix at a reserved point, or reject a stale/late plan."""
+
+        offset = ticket.splice_sample - self._consumed_samples
+        if ticket.queue_revision != self._revision:
+            return ServoPlanCommit(False, "stale", max(0, offset))
+        if offset < 0:
+            return ServoPlanCommit(False, "late", 0)
+
+        expected = self.at_offset(offset)
         first = single_joint_state(state, 0)
         errors = [
-            float((getattr(current, name) - getattr(first, name)).abs().max().item())
+            float((getattr(expected, name) - getattr(first, name)).abs().max().item())
             for name in ("position", "velocity", "acceleration")
         ]
         if max(errors) > tolerance:
-            raise RuntimeError(f"new trajectory is discontinuous: {errors}")
-        self._state = state.clone()
+            return ServoPlanCommit(False, "discontinuous", offset, tuple(errors))
+
+        if offset:
+            prefix = slice_joint_trajectory(
+                self._state, self._head, self._head + offset
+            )
+            self._state = concatenate_joint_trajectories(prefix, state)
+        else:
+            self._state = state.clone()
         self._head = 0
+        self._revision += 1
+        return ServoPlanCommit(True, "accepted", offset, tuple(errors))

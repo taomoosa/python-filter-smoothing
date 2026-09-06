@@ -68,23 +68,132 @@ virtual environment is in the sibling `../curobo` checkout.
   --mpc-config python_filter_smoothing/configs/long_mpc.yml
 ```
 
+Viser binds to `127.0.0.1` by default. Use `--host 0.0.0.0` only on a trusted
+network.
+
+### Adapting the example to another mechanism
+
+The example code has no fixed joint count or joint names. Start by copying
+`configs/long_mpc.yml` as the mechanism/optimizer profile and, when the start
+pose or targets differ, copy `configs/long_mpc_application.yml` as the application
+profile. Point its `long_mpc_config` at the first file, or override that path on
+the command line:
+
+```bash
+../curobo/.venv/bin/python long_mpc_example.py \
+  --config path/to/my_robot_application.yml \
+  --mpc-config path/to/my_robot_mpc.yml \
+  --output artifacts/my_robot_mpc
+
+# summary.json records a portable MPC YAML reference, so no robot argument is needed.
+../curobo/.venv/bin/python visualize_mpc_trajectory.py \
+  artifacts/my_robot_mpc
+```
+
+Most adaptations should only need these YAML groups:
+
+| Group | Tune for a new mechanism |
+|---|---|
+| `robot`, `scene` | cuRobo robot YAML, collision spheres, world, and optional conservative limit scales |
+| `example.initial_joint_positions_rad` | `null`, a partial joint-name mapping, or a full joint-order sequence; choose a bent, nonsingular, collision-free pose |
+| `example.target_*` | reachable XYZ offsets and relative rot6D orientations, both based on that initial tool pose |
+| `timing` | optimization dt and control points; preserve enough real-time horizon for obstacle detours |
+| `tool_pose_weight` | task accuracy priority for translation and rotation |
+| `scene_collision_weight`, `self_collision_weight` | raise until additional iterations do not trade penetration for pose error |
+| `cspace_bound_weight` | soft costs for position/velocity/acceleration/jerk/effort bounds |
+| `squared_l2_regularization_weight` | velocity/acceleration/jerk/torque/energy smoothness; weaken cautiously because reversals can increase |
+| `target_update` | independent iteration checkpoints, IK reference/seed, fallback seed count, and nearby IK poses |
+| `application` | queue connection delay, physical acceptance, and progress gate |
+| `resampling` | servo-rate interpolation and filter duration; keep generation limits at or below 1.0 initially |
+
+Joint derivative limits come from the cuRobo robot YAML `cspace` section; the
+three `robot.*_limit_scale` values only scale them. Weight magnitudes are not
+portable by themselves: pose, cspace, and collision costs have different units
+and robot-dependent normalization. A practical tuning order is (1) validate the
+start pose and IK, (2) choose horizon and target offsets, (3) make collision strong
+relative to pose tracking, (4) tune motion regularization, and (5) measure the
+planner-time distribution before setting `planning_connection_delay_s`. Keep the
+5 ms application-side collision and physical-limit checks enabled throughout.
+
 `ContinuousMpcTrajectory.solve_horizon()` only returns a complete cuRobo
 `q/dq/ddq` rollout. For each Cartesian target, the adapter first solves IK from
 the connection state, installs the result as the joint reference and optimizer
-seed, and falls back to several global IK seeds when needed. The iteration counts
+seed, and falls back to several global IK seeds and configured nearby XYZ targets
+when needed. Nearby candidates retain the requested orientation and are tried in
+`ik_position_offsets_m` order. The straight joint seed is allowed to intersect the
+scene: only the optimized output is required to pass the strict collision gate.
+The iteration counts
 in `optimizer.target_update.candidate_iterations` are independent cold solves.
 The application archives every feasible result and ranks feasible candidates by
 terminal pose error; a later infeasible solve therefore cannot erase an earlier
 safe result.
 
-Selection, resampling, final validation, and queue ownership remain in the
-application. The synchronous example plans from the state already queued at the
-configured future connection time. The old verified queue continues during
-calculation; a new path is published only if it arrives before that boundary,
-respects derivative limits, and passes cspace, self-collision, and scene-collision
-checks at every 5 ms output point. If IK, every MPC candidate, post-processing, or
-the deadline fails, the queue is left untouched. A stationary terminal state may
-be held after queue exhaustion, but a moving terminal state is never extended.
+Selection, progress checks, final validation, and command publication remain in
+the application. `application.execution_mode` selects `future_queue` (the verified
+old path continues during calculation) or `immediate` (planning time is ignored,
+for offline/blocking use). The same choice is available from the command line:
+
+```bash
+../curobo/.venv/bin/python long_mpc_example.py \
+  --execution-mode future_queue
+../curobo/.venv/bin/python long_mpc_example.py \
+  --execution-mode immediate
+```
+
+With `future_queue`, the example plans from the state already queued at the
+configured connection time. A new path is published only if it arrives before
+that boundary, improves the target error, respects derivative limits, and passes
+cspace, self-collision, and scene-collision checks at every 5 ms output point.
+If a check fails, the queue is left untouched and the target is retried from a
+newly reserved future state after the old queue advances. A stationary terminal
+state may be held after exhaustion, but a moving terminal state is never extended.
+
+The reusable application-side API is intentionally independent of the solver:
+
+```python
+from python_filter_smoothing.mpc_application import (
+    MpcCommandApplication, PoseError, PoseProgressPolicy
+)
+
+app = MpcCommandApplication(initial_path, mode="future_queue", connection_samples=50)
+request = app.begin_plan()                 # future q/dq/ddq supplied to MPC
+candidate = solve(request.initial_state)   # application-specific MPC call
+old_commands = app.consume_during_planning(elapsed_samples)
+quality = PoseProgressPolicy().evaluate(initial_error, terminal_error)
+if candidate.feasible and quality.accepted and validate(candidate):
+    app.publish(request, candidate.state)  # failure leaves the old path intact
+command = app.consume(1)                   # called by the servo side
+```
+
+The progress gate defaults to at least 2 mm positional improvement, or acceptance
+inside 15 mm. Orientation progress is optional. All thresholds are in
+`application.progress` in `long_mpc_application.yml`; this gate supplements rather
+than replaces cuRobo feasibility and full-path constraint validation. It compares
+only the start and endpoint, so detours inside one horizon are allowed; disable or
+relax it when a valid plan must end its current horizon farther from the goal.
+
+`application.constraint_acceptance.cspace_mode` uses `physical_limits`. This mode
+ignores only cuRobo's aggregate `cspace` result,
+then independently checks joint position and the sampled velocity, acceleration,
+and discrete jerk. Self- and scene-collision constraints are never ignored. The
+maintained profile keeps acceleration effectively strict and allows a 5%
+application-side jerk margin:
+
+```bash
+../curobo/.venv/bin/python long_mpc_example.py \
+  --cspace-acceptance physical_limits \
+  --maximum-acceleration-ratio 1.001 \
+  --maximum-jerk-ratio 1.05
+```
+
+These flags change application acceptance only. Trajectory-generation limits stay
+independent in `resampling.*_limit_scale`; their maintained values are 1.0. With
+nominal resampling limits, 1000-case testing used none of that extra jerk margin:
+the maximum executed ratio remained below 1.0. The 1.05 value is application
+headroom, not a generation target. Raising both generation and acceptance to 1.25
+added little task progress and increased excessive velocity-reversal phases, so it
+is not recommended. This is an application policy, not a change to cuRobo or the
+robot model; select `--cspace-acceptance strict` to require the aggregate result.
 
 Both resamplers use the same short centered Savitzky–Golay position filter, restore
 the first and last `q/dq/ddq`, and pass through the same final validation. The filter
@@ -96,9 +205,9 @@ collision proof.
 Optimizer execution policy is explicit in `long_mpc.yml`. Setup uses
 `optimizer.cold_start_iterations`; target updates use
 `target_update.candidate_iterations`, `use_ik_joint_reference`, `seed_from_ik`,
-and `ik_fallback_seeds`. Each independent solve resets the old optimizer cache
-after the target change. `fixed_iterations` and `return_best_action` map directly
-to the cuRobo optimizer configuration. The synchronous example is an asynchronous
+`ik_fallback_seeds`, and `ik_position_offsets_m`. Each independent solve resets
+the old optimizer cache after the target change. `fixed_iterations` and
+`return_best_action` map directly to the cuRobo optimizer configuration. The synchronous example is an asynchronous
 planner/servo model: production code should run the same producer in a worker and
 let the servo loop consume the verified queue without waiting.
 

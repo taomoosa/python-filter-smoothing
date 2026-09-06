@@ -26,7 +26,16 @@ DEFAULT_MPC_CONFIG = (
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("artifact", type=Path)
-    parser.add_argument("--mpc-config", type=Path, default=DEFAULT_MPC_CONFIG)
+    parser.add_argument(
+        "--mpc-config",
+        type=Path,
+        help="override the MPC YAML recorded in summary.json",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Viser bind address; use 0.0.0.0 only on a trusted network",
+    )
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--rate", type=float, default=1.0)
     parser.add_argument("--no-hold", action="store_true")
@@ -46,17 +55,27 @@ def main() -> None:
         [values[:, column_index[f"q_rad_{joint}"]] for joint in joint_names]
     )
 
-    config = load_config(args.mpc_config)
+    if args.mpc_config is not None:
+        mpc_config = args.mpc_config
+    else:
+        recorded_config = Path(summary.get("mpc_config", DEFAULT_MPC_CONFIG))
+        mpc_config = (
+            recorded_config
+            if recorded_config.is_absolute()
+            else args.artifact.resolve() / recorded_config
+        )
+    config = load_config(mpc_config)
     visualizer = ViserVisualizer(
         content_path=ContentPath(robot_config_file=config["robot"]["config"]),
-        connect_ip="0.0.0.0",
+        connect_ip=args.host,
         connect_port=args.port,
         add_control_frames=False,
         add_robot_to_scene=True,
     )
     visualizer.add_scene(SceneCfg.create(load_yaml(config["scene"])))
     dt = float(summary["command_dt_s"]) / args.rate
-    print(f"Viser playback: http://localhost:{args.port}")
+    display_host = "localhost" if args.host == "0.0.0.0" else args.host
+    print(f"Viser playback: http://{display_host}:{args.port}")
     try:
         for position in q:
             visualizer.set_joint_state(

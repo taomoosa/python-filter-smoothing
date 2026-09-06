@@ -12,6 +12,8 @@ from scipy.interpolate import CubicHermiteSpline
 
 from .trajectory_filter import filter_joint_trajectory_savgol
 
+INITIAL_STATE_MATCH_ATOL = (1.0e-6, 1.0e-5, 1.0e-4)
+
 
 @dataclass(frozen=True)
 class ResampledJointTrajectory:
@@ -42,6 +44,45 @@ def _nodes(value: np.ndarray, name: str) -> np.ndarray:
     if not np.all(np.isfinite(result)):
         raise ValueError(f"{name} must be finite")
     return result
+
+
+def connect_initial_state_to_horizon(
+    initial_state: tuple[np.ndarray, np.ndarray, np.ndarray],
+    horizon: tuple[np.ndarray, np.ndarray, np.ndarray],
+    match_atol: tuple[float, float, float] = INITIAL_STATE_MATCH_ATOL,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Connect q/dq/ddq without duplicating cuRobo's time-zero state.
+
+    cuRobo's returned state sequence starts at the supplied initial state.  The
+    application keeps its exact queue state and skips that first horizon state
+    when all three components agree within float32-scale tolerances.
+    """
+
+    initial = tuple(np.asarray(value, dtype=np.float64).reshape(-1) for value in initial_state)
+    source = tuple(np.asarray(value, dtype=np.float64) for value in horizon)
+    dof = initial[0].shape[0]
+    if any(value.shape != (dof,) for value in initial):
+        raise ValueError("initial q/dq/ddq must have the same DOF")
+    if any(value.ndim != 2 or value.shape[1] != dof for value in source):
+        raise ValueError("horizon q/dq/ddq must have shape [nodes, DOF]")
+    if len({len(value) for value in source}) != 1 or len(source[0]) < 1:
+        raise ValueError("horizon q/dq/ddq must have the same nonzero length")
+    if not all(np.all(np.isfinite(value)) for value in (*initial, *source)):
+        raise ValueError("initial and horizon q/dq/ddq must be finite")
+    if any(not math.isfinite(value) or value < 0.0 for value in match_atol):
+        raise ValueError("initial-state match tolerances must be finite and nonnegative")
+
+    duplicate = len(source[0]) > 1 and all(
+        np.allclose(first, values[0], rtol=0.0, atol=tolerance)
+        for first, values, tolerance in zip(
+            initial, source, match_atol, strict=True
+        )
+    )
+    first_horizon_index = 1 if duplicate else 0
+    return tuple(
+        np.concatenate((first[None], values[first_horizon_index:]), axis=0)
+        for first, values in zip(initial, source, strict=True)
+    )
 
 
 def _limits(value: np.ndarray, dof: int, name: str) -> np.ndarray:

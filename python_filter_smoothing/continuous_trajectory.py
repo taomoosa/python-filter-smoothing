@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +96,50 @@ def _iteration_sequence(value: Any, name: str) -> tuple[int, ...]:
     return result
 
 
+def _position_offset_sequence(
+    value: Any, name: str
+) -> tuple[tuple[float, float, float], ...]:
+    """Validate preferred Cartesian offsets for nearby-target IK."""
+
+    if value is None:
+        return ((0.0, 0.0, 0.0),)
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{name} must be a nonempty sequence")
+    result = []
+    for index, item in enumerate(value):
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            raise ValueError(f"{name}[{index}] must contain XYZ")
+        offset = tuple(float(component) for component in item)
+        if not all(math.isfinite(component) for component in offset):
+            raise ValueError(f"{name}[{index}] must be finite")
+        result.append(offset)
+    if result[0] != (0.0, 0.0, 0.0):
+        raise ValueError(f"{name}[0] must be the exact target [0, 0, 0]")
+    if len(set(result)) != len(result):
+        raise ValueError(f"{name} must not contain duplicate offsets")
+    return tuple(result)
+
+
+def _weight_sequence(value: Any, name: str, length: int) -> list[float]:
+    """Validate an optimizer weight vector before constructing cuRobo."""
+
+    if not isinstance(value, (list, tuple)) or len(value) != length:
+        raise ValueError(f"{name} must contain {length} values")
+    result = [float(item) for item in value]
+    if any(not math.isfinite(item) or item < 0.0 for item in result):
+        raise ValueError(f"{name} values must be finite and nonnegative")
+    return result
+
+
+def _weight(value: Any, name: str) -> float:
+    """Validate a scalar optimizer weight."""
+
+    result = float(value)
+    if not math.isfinite(result) or result < 0.0:
+        raise ValueError(f"{name} must be finite and nonnegative")
+    return result
+
+
 def _robot_config(config: dict[str, Any]) -> dict[str, Any]:
     robot_options = config["robot"]
     robot = load_yaml(robot_options["config"])
@@ -116,11 +162,27 @@ def _solver(config: dict[str, Any]) -> ModelPredictiveControl:
         optimizer_options.get("return_best_action", True)
     )
     costs = optimizer["rollout"]["cost_cfg"]
-    costs["tool_pose_cfg"]["weight"] = optimizer_options["tool_pose_weight"]
-    costs["cspace_cfg"]["weight"] = optimizer_options["cspace_bound_weight"]
+    costs["tool_pose_cfg"]["weight"] = _weight_sequence(
+        optimizer_options["tool_pose_weight"], "optimizer.tool_pose_weight", 2
+    )
+    costs["cspace_cfg"]["weight"] = _weight_sequence(
+        optimizer_options["cspace_bound_weight"],
+        "optimizer.cspace_bound_weight",
+        5,
+    )
     if "scene_collision_weight" in optimizer_options:
         optimizer["rollout"]["constraint_cfg"]["scene_collision_cfg"]["weight"] = (
-            optimizer_options["scene_collision_weight"]
+            _weight(
+                optimizer_options["scene_collision_weight"],
+                "optimizer.scene_collision_weight",
+            )
+        )
+    if "self_collision_weight" in optimizer_options:
+        optimizer["rollout"]["constraint_cfg"]["self_collision_cfg"]["weight"] = (
+            _weight(
+                optimizer_options["self_collision_weight"],
+                "optimizer.self_collision_weight",
+            )
         )
 
     timing = config["timing"]
@@ -133,9 +195,11 @@ def _solver(config: dict[str, Any]) -> ModelPredictiveControl:
         optimization_dt=timing["optimization_dt_s"],
         interpolation_steps=timing["interpolation_steps"],
         num_control_points=timing["control_points"],
-        squared_l2_regularization_weight=optimizer_options[
-            "squared_l2_regularization_weight"
-        ],
+        squared_l2_regularization_weight=_weight_sequence(
+            optimizer_options["squared_l2_regularization_weight"],
+            "optimizer.squared_l2_regularization_weight",
+            5,
+        ),
         non_terminal_tool_pose_weight_factor=optimizer_options[
             "non_terminal_tool_pose_weight_factor"
         ],
@@ -156,7 +220,7 @@ def _solver(config: dict[str, Any]) -> ModelPredictiveControl:
 
 
 def _fallback_ik_solver(
-    config: dict[str, Any], num_seeds: int
+    config: dict[str, Any], num_seeds: int, max_batch_size: int
 ) -> InverseKinematics:
     runtime = config["runtime"]
     collision = config["collision"]
@@ -164,12 +228,23 @@ def _fallback_ik_solver(
         robot=_robot_config(config),
         scene_model=load_yaml(config["scene"]),
         num_seeds=num_seeds,
+        max_batch_size=max_batch_size,
         optimizer_collision_activation_distance=collision["activation_distance_m"],
         self_collision_check=collision["self_collision_check"],
         use_cuda_graph=runtime["use_cuda_graph"],
         random_seed=runtime["random_seed"],
     )
     return InverseKinematics(solver_config)
+
+
+@dataclass(frozen=True)
+class MpcTargetSelection:
+    """IK-selected target; candidate zero is the exact requested pose."""
+
+    candidate_index: int
+    position_m: torch.Tensor
+    quaternion_wxyz: torch.Tensor
+    joint_state: JointState
 
 
 class ContinuousMpcTrajectory:
@@ -189,6 +264,10 @@ class ContinuousMpcTrajectory:
             target_update.get("ik_fallback_seeds", 1),
             "optimizer.target_update.ik_fallback_seeds",
         )
+        self._ik_position_offsets_m = _position_offset_sequence(
+            target_update.get("ik_position_offsets_m"),
+            "optimizer.target_update.ik_position_offsets_m",
+        )
         timing = self.config["timing"]
         self.timing = MpcTiming(
             optimization_dt_s=float(timing["optimization_dt_s"]),
@@ -196,8 +275,16 @@ class ContinuousMpcTrajectory:
         )
         self.solver = _solver(self.config)
         self._fallback_ik = (
-            _fallback_ik_solver(self.config, self._ik_fallback_seeds)
-            if self._use_ik_joint_reference and self._ik_fallback_seeds > 1
+            _fallback_ik_solver(
+                self.config,
+                self._ik_fallback_seeds,
+                len(self._ik_position_offsets_m),
+            )
+            if self._use_ik_joint_reference
+            and (
+                self._ik_fallback_seeds > 1
+                or len(self._ik_position_offsets_m) > 1
+            )
             else None
         )
         self._setup_cold_start_iterations = _positive_iterations(
@@ -223,6 +310,7 @@ class ContinuousMpcTrajectory:
         )
         self._goal_request: GoalToolPose | None = None
         self._joint_reference_state: JointState | None = None
+        self._last_target_selection: MpcTargetSelection | None = None
 
     @property
     def joint_names(self) -> list[str]:
@@ -233,6 +321,12 @@ class ContinuousMpcTrajectory:
         """Independent cold-solve iteration counts configured for one target."""
 
         return self._candidate_iterations
+
+    @property
+    def last_target_selection(self) -> MpcTargetSelection | None:
+        """Return the IK pose selected for the active target, if applicable."""
+
+        return self._last_target_selection
 
     def default_state(self) -> JointState:
         """Return a finite q/dq/ddq state suitable for initial setup."""
@@ -250,6 +344,7 @@ class ContinuousMpcTrajectory:
         )
         self._planner.setup(initial_state)
         self._joint_reference_state = None
+        self._last_target_selection = None
         initial_poses = self.solver.compute_kinematics(
             initial_state
         ).tool_poses.to_dict()
@@ -259,7 +354,46 @@ class ContinuousMpcTrajectory:
             num_goalset=1,
         )
 
-    def _solve_target_ik(self, current: JointState) -> JointState:
+    def _target_selection(
+        self,
+        candidate_index: int,
+        joint_position: torch.Tensor,
+    ) -> MpcTargetSelection:
+        if self._goal_request is None:
+            raise RuntimeError("setup() must be called before set_target()")
+        offset = torch.as_tensor(
+            self._ik_position_offsets_m[candidate_index],
+            device=self._goal_request.position.device,
+            dtype=self._goal_request.position.dtype,
+        )
+        return MpcTargetSelection(
+            candidate_index=candidate_index,
+            position_m=(self._goal_request.position[0, 0, 0, 0] + offset).clone(),
+            quaternion_wxyz=self._goal_request.quaternion[0, 0, 0, 0].clone(),
+            joint_state=JointState.from_position(
+                joint_position.reshape(1, -1).clone(), joint_names=self.joint_names
+            ),
+        )
+
+    def _nearby_goal_batch(self) -> GoalToolPose:
+        if self._goal_request is None:
+            raise RuntimeError("setup() must be called before set_target()")
+        count = len(self._ik_position_offsets_m)
+        position = self._goal_request.position.repeat(count, 1, 1, 1, 1)
+        quaternion = self._goal_request.quaternion.repeat(count, 1, 1, 1, 1)
+        offsets = torch.as_tensor(
+            self._ik_position_offsets_m,
+            device=position.device,
+            dtype=position.dtype,
+        )
+        position[:, 0, 0, 0, :] += offsets
+        return GoalToolPose(
+            tool_frames=list(self._goal_request.tool_frames),
+            position=position,
+            quaternion=quaternion,
+        )
+
+    def _solve_target_ik(self, current: JointState) -> MpcTargetSelection:
         if self._goal_request is None or not isinstance(current.position, torch.Tensor):
             raise RuntimeError("setup() must be called before set_target()")
         solver = self.solver.ik_solver
@@ -271,21 +405,29 @@ class ContinuousMpcTrajectory:
         )
         if bool(torch.any(result.success).item()):
             solution = result.solution.reshape(-1, len(self.joint_names))[:1]
-            return JointState.from_position(
-                solution.clone(), joint_names=self.joint_names
-            )
+            return self._target_selection(0, solution[0])
 
         if self._fallback_ik is not None:
             self._fallback_ik.reset_seed()
             result = self._fallback_ik.solve_pose(
-                goal_tool_poses=self._goal_request,
+                goal_tool_poses=self._nearby_goal_batch(),
                 current_state=None,
                 seed_config=None,
                 return_seeds=self._ik_fallback_seeds,
             )
-            success = result.success.reshape(-1)
+            candidate_count = len(self._ik_position_offsets_m)
+            success = result.success.reshape(candidate_count, -1)
             if bool(torch.any(success).item()):
-                solutions = result.solution.reshape(-1, len(self.joint_names))
+                # Offset order is an application priority: exact target first,
+                # then progressively relaxed nearby poses.  Collision along the
+                # straight joint seed is deliberately not tested here; avoiding
+                # it is the MPC optimization's job.
+                candidate_index = int(
+                    torch.nonzero(torch.any(success, dim=1), as_tuple=False)[0, 0]
+                )
+                solutions = result.solution.reshape(
+                    candidate_count, -1, len(self.joint_names)
+                )[candidate_index]
                 bounds = self.solver.transition_model.get_state_bounds().position
                 scale = (bounds[1] - bounds[0]).clamp_min(1.0e-6)
                 distance = torch.sum(
@@ -294,12 +436,9 @@ class ContinuousMpcTrajectory:
                     ),
                     dim=-1,
                 )
-                distance[~success] = torch.inf
+                distance[~success[candidate_index]] = torch.inf
                 index = int(torch.argmin(distance).item())
-                return JointState.from_position(
-                    solutions[index : index + 1].clone(),
-                    joint_names=self.joint_names,
-                )
+                return self._target_selection(candidate_index, solutions[index])
 
         position_error = float(result.position_error.min().item())
         rotation_error = float(result.rotation_error.min().item())
@@ -330,13 +469,22 @@ class ContinuousMpcTrajectory:
         goal.position[:, :, 0, :, :].copy_(position_m.reshape(1, 1, 1, 3))
         if quaternion_wxyz is not None:
             goal.quaternion[:, :, 0, :, :].copy_(quaternion_wxyz.reshape(1, 1, 1, 4))
-        joint_reference = (
+        selection = (
             self._solve_target_ik(current)
             if validate_ik or self._use_ik_joint_reference
             else None
         )
+        joint_reference = selection.joint_state if selection is not None else None
+        self._last_target_selection = selection
         if validate_ik:
             return joint_reference
+        if selection is not None:
+            goal.position[:, :, 0, 0, :].copy_(
+                selection.position_m.reshape(1, 1, 3)
+            )
+            goal.quaternion[:, :, 0, 0, :].copy_(
+                selection.quaternion_wxyz.reshape(1, 1, 4)
+            )
         if not self.solver.update_goal_tool_poses(goal, run_ik=False):
             raise RuntimeError("Cartesian goal update failed")
         self._joint_reference_state = joint_reference

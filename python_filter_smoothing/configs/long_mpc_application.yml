@@ -1,24 +1,63 @@
-# Long collision-aware MPC followed by a selectable 5 ms trajectory resampler.
+# Mechanism-independent application policy plus a runnable relative-target example.
+# Copy this file only when start pose, targets, servo timing, or policy must differ.
 long_mpc_config: long_mpc.yml
 
 example:
   duration_s: 8.0
   target_period_s: 4.0
   servo_dt_s: 0.005
-  # Five independent candidates took about 194 ms at the measured median.
-  planning_connection_delay_s: 0.250
+  # null uses robot.config's default_joint_position. A mapping may override a
+  # subset by joint name; a sequence must contain every joint in robot order.
+  # Example: {panda_joint2: -0.6, panda_joint4: -2.0}
+  initial_joint_positions_rad: null
+  # XYZ offsets are relative to the tool pose at initial_joint_positions_rad,
+  # which makes this example reusable when robot base/world coordinates differ.
   target_offsets_m:
     - [0.000, 0.100, 0.000]
     - [0.000, -0.100, 0.020]
+  # Relative Zhou rot6D: first two columns of a rotation matrix. Identity leaves
+  # the initial tool orientation unchanged; values are projected onto SO(3).
   target_rotation_offsets_rot6d:
     - [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
     - [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
   output_directory: ../../artifacts/long_mpc
 
+# These decisions belong to the application, not to cuRobo's MPC solver.
+application:
+  # future_queue executes the verified old path while MPC is calculating.
+  # immediate ignores calculation time and is intended for offline/blocking use.
+  execution_mode: future_queue
+  # Set at or above the measured high percentile for the selected mechanism and
+  # candidate iterations. The old verified queue is consumed during this delay.
+  planning_connection_delay_s: 0.250
+  # Used to advance an old path between failed retries in immediate mode.
+  failed_plan_retry_period_s: 0.050
+  constraint_acceptance:
+    # strict: require cuRobo cspace/self/scene constraints.
+    # physical_limits: replace only cspace with the explicit checks below;
+    # self/scene collision constraints are still mandatory.
+    cspace_mode: physical_limits
+    maximum_velocity_ratio: 1.001
+    maximum_acceleration_ratio: 1.001
+    # Application-side allowance only; generation remains at the nominal limit.
+    maximum_jerk_ratio: 1.05
+    position_tolerance_rad: 0.000001
+  progress:
+    enabled: true
+    # Accept when the endpoint improves by this amount or is already in tolerance.
+    minimum_position_improvement_m: 0.002
+    position_tolerance_m: 0.015
+    # Enable this when every accepted segment must also improve orientation.
+    check_rotation: false
+    minimum_rotation_improvement_rad: 0.010
+    rotation_tolerance_rad: 0.080
+
 resampling:
   # hermite is the standard path. ruckig is retained as a selectable alternative.
   method: hermite
   velocity_limit_scale: 1.0
+  # Generation limits are intentionally independent of application acceptance.
+  # Keep acceleration/jerk at nominal even when accepting a small sampled residual.
   acceleration_limit_scale: 1.0
   jerk_limit_scale: 1.0
   hermite:
@@ -31,6 +70,7 @@ resampling:
     max_time_scale_iterations: 12
   post_filter:
     method: savgol_position
-    # 9 samples x 5 ms = 45 ms spans two 20 ms long-MPC intervals.
+    # 9 samples x 5 ms = 45 ms spans two 20 ms long-MPC intervals. Retune this
+    # duration, not just the sample count, when servo_dt_s changes.
     window_length_samples: 9
     polynomial_order: 2

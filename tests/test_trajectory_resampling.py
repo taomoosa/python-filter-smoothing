@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from python_filter_smoothing.trajectory_resampling import (
+    connect_initial_state_to_horizon,
     derivative_limit_ratios,
     resample_joint_trajectory,
 )
@@ -76,3 +77,36 @@ def test_unknown_resampler_is_rejected() -> None:
             max_position=np.ones(1),
             options=_options("bad"),
         )
+
+
+def test_connect_initial_state_drops_duplicate_curobo_time_zero_node() -> None:
+    initial = (
+        np.asarray([0.1]),
+        np.asarray([0.5]),
+        np.asarray([-0.25]),
+    )
+    horizon = (
+        np.asarray([[0.1 + 2.0e-7], [0.11], [0.12]]),
+        np.asarray([[0.5 + 2.0e-6], [0.5], [0.0]]),
+        np.asarray([[-0.25 + 2.0e-5], [0.0], [0.0]]),
+    )
+
+    connected = connect_initial_state_to_horizon(initial, horizon)
+
+    assert all(value.shape == (3, 1) for value in connected)
+    assert tuple(value[0, 0] for value in connected) == (0.1, 0.5, -0.25)
+    assert np.array_equal(connected[0][1:], horizon[0][1:])
+
+
+def test_connect_initial_state_keeps_a_real_first_future_node() -> None:
+    initial = tuple(np.asarray([value]) for value in (0.1, 0.5, -0.25))
+    horizon = (
+        np.asarray([[0.105], [0.11]]),
+        np.asarray([[0.5], [0.0]]),
+        np.asarray([[0.0], [0.0]]),
+    )
+
+    connected = connect_initial_state_to_horizon(initial, horizon)
+
+    assert all(value.shape == (3, 1) for value in connected)
+    assert np.array_equal(connected[0][1:], horizon[0])

@@ -1,24 +1,41 @@
-# Low-rate, long-horizon MPC used only to generate a moving reference path.
+# Runnable Franka profile and template for another mechanism.
+# Copy this file, then tune robot/scene, timing, optimizer weights, and IK settings.
+# The application, queue, validation, and resampling policy live in the companion
+# long_mpc_application.yml and normally require no code changes.
 robot:
+  # cuRobo robot YAML: joint order/limits, kinematics, collision spheres, and
+  # default_joint_position are authoritative for this example.
   config: franka.yml
+  # These scales can reduce configured robot limits; keep 1.0 while tuning costs.
   velocity_limit_scale: 1.0
   acceleration_limit_scale: 1.0
   jerk_limit_scale: 1.0
 
+# Replace this with the workspace used by the mechanism.
 scene: ../scenes/desk.yml
 
 timing:
+  # Larger dt/control-point count extends the useful planning horizon. Smaller dt
+  # improves temporal resolution but makes long detours harder at a fixed count.
   optimization_dt_s: 0.020
+  # cuRobo's current MPC transition requires four interpolation steps.
   interpolation_steps: 4
   control_points: 32
 
 optimizer:
   base_config: mpc/lbfgs_mpc.yml
+  # [translation, rotation]. Scale these for the task before copying collision
+  # weights from another robot; absolute magnitudes are not portable.
   tool_pose_weight: [50000.0, 1000.0]
   non_terminal_tool_pose_weight_factor: 0.20
+  # [position, velocity, acceleration, jerk, effort] soft-bound costs.
   cspace_bound_weight: [1000.0, 1000.0, 1000.0, 100.0, 0.0]
+  # [velocity, acceleration, jerk, torque, energy] L2 regularization.
   squared_l2_regularization_weight: [0.01, 5000.0, 500.0, 0.0, 0.0]
+  # Collision should be strong enough that a lower pose error cannot profitably
+  # trade against penetration. Final application validation remains strict.
   scene_collision_weight: 100000.0
+  self_collision_weight: 100000.0
   warm_start_iterations: 150
   # setup() initializes a cheap hold-goal seed.
   cold_start_iterations: 300
@@ -30,9 +47,23 @@ optimizer:
     candidate_iterations: [50, 100, 200, 400, 1100]
     use_ik_joint_reference: true
     seed_from_ik: true
+    # Raise this for mechanisms with many IK branches; it increases setup tails.
     ik_fallback_seeds: 8
+    # If exact-pose IK fails, try these positions in order with the same
+    # orientation. The resulting joint-space straight seed may intersect the
+    # scene; MPC, not the IK selector, is responsible for deforming that seed.
+    ik_position_offsets_m:
+      - [0.00, 0.00, 0.00]
+      - [0.01, 0.00, 0.00]
+      - [-0.01, 0.00, 0.00]
+      - [0.00, 0.01, 0.00]
+      - [0.00, -0.01, 0.00]
+      - [0.00, 0.00, 0.01]
+      - [0.00, 0.00, -0.01]
 
 collision:
+  # Begin penalizing distance this far before contact. This is not an additional
+  # post-validation clearance requirement.
   activation_distance_m: 0.01
   self_collision_check: true
 

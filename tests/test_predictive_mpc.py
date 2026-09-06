@@ -5,11 +5,13 @@ from typing import ClassVar
 
 import pytest
 import torch
-from curobo.types import JointState
+from curobo.types import GoalToolPose, JointState
 
 from python_filter_smoothing.continuous_trajectory import (
     ContinuousMpcTrajectory,
+    MpcTargetSelection,
     _iteration_sequence,
+    _position_offset_sequence,
     _positive_iterations,
 )
 from python_filter_smoothing.predictive_mpc import (
@@ -67,6 +69,12 @@ def test_optimizer_iterations_must_be_positive_integers(value: object) -> None:
         _positive_iterations(value, "optimizer.test_iterations")
 
 
+def test_nearby_ik_offsets_require_exact_target_first() -> None:
+    assert _position_offset_sequence(None, "offsets") == ((0.0, 0.0, 0.0),)
+    with pytest.raises(ValueError, match="exact target"):
+        _position_offset_sequence([[0.01, 0.0, 0.0]], "offsets")
+
+
 @pytest.mark.parametrize("value", [[], [100, 50], [50, 50]])
 def test_candidate_iterations_must_be_increasing(value: list[int]) -> None:
     with pytest.raises(ValueError, match="strictly increasing|nonempty"):
@@ -110,7 +118,7 @@ def test_target_update_prepares_first_independent_candidate() -> None:
     )
 
 
-def test_candidate_reset_reapplies_joint_reference_and_seed() -> None:
+def test_candidate_reset_reapplies_joint_reference_and_unchecked_seed() -> None:
     class TargetSolver:
         def __init__(self) -> None:
             self.config = SimpleNamespace(cold_start_optimization_num_iters=50)
@@ -138,6 +146,105 @@ def test_candidate_reset_reapplies_joint_reference_and_seed() -> None:
 
     assert solver.config.cold_start_optimization_num_iters == 200
     assert solver.calls == ["reset", "goal", "track", "seed"]
+
+
+def test_nearby_ik_uses_first_solvable_offset_and_nearest_joint_branch() -> None:
+    class ExactIk:
+        def solve_pose(self, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                success=torch.tensor([[False]]),
+                solution=torch.zeros((1, 1, 1)),
+                position_error=torch.tensor([[0.1]]),
+                rotation_error=torch.tensor([[0.2]]),
+            )
+
+    class NearbyIk:
+        def reset_seed(self) -> None:
+            self.reset = True
+
+        def solve_pose(self, **kwargs: object) -> SimpleNamespace:
+            self.goal = kwargs["goal_tool_poses"]
+            return SimpleNamespace(
+                success=torch.tensor(
+                    [[False, False], [True, True], [True, True]]
+                ),
+                solution=torch.tensor(
+                    [[[0.0], [0.0]], [[0.8], [0.3]], [[-0.1], [-0.2]]]
+                ),
+                position_error=torch.zeros((3, 2)),
+                rotation_error=torch.zeros((3, 2)),
+            )
+
+    nearby = NearbyIk()
+    solver = SimpleNamespace(
+        joint_names=["j1"],
+        ik_solver=ExactIk(),
+        transition_model=SimpleNamespace(
+            get_state_bounds=lambda: SimpleNamespace(
+                position=torch.tensor([[-1.0], [1.0]])
+            )
+        ),
+    )
+    application = ContinuousMpcTrajectory.__new__(ContinuousMpcTrajectory)
+    application.solver = solver
+    application._fallback_ik = nearby
+    application._ik_fallback_seeds = 2
+    application._ik_position_offsets_m = (
+        (0.0, 0.0, 0.0),
+        (0.01, 0.0, 0.0),
+        (0.0, 0.01, 0.0),
+    )
+    application._goal_request = GoalToolPose(
+        tool_frames=["tool"],
+        position=torch.tensor([[[[[0.4, 0.2, 0.1]]]]]),
+        quaternion=torch.tensor([[[[[1.0, 0.0, 0.0, 0.0]]]]]),
+    )
+
+    selected = application._solve_target_ik(_state())
+
+    assert selected.candidate_index == 1
+    assert selected.position_m.tolist() == pytest.approx([0.41, 0.2, 0.1])
+    assert selected.joint_state.position.item() == pytest.approx(0.3)
+    assert nearby.goal.position.shape == (3, 1, 1, 1, 3)
+
+
+def test_selected_nearby_pose_becomes_the_mpc_target() -> None:
+    class TargetSolver:
+        def update_goal_tool_poses(self, goal: GoalToolPose, *, run_ik: bool) -> bool:
+            assert not run_ik
+            self.position = goal.position.clone()
+            return True
+
+    application = ContinuousMpcTrajectory.__new__(ContinuousMpcTrajectory)
+    application.solver = TargetSolver()
+    application._planner = SimpleNamespace(current_state=_state())
+    application._goal_request = GoalToolPose(
+        tool_frames=["tool"],
+        position=torch.zeros((1, 1, 1, 1, 3)),
+        quaternion=torch.tensor([[[[[1.0, 0.0, 0.0, 0.0]]]]]),
+    )
+    application._candidate_iterations = (50,)
+    application._use_ik_joint_reference = True
+    application._joint_reference_state = None
+    application._last_target_selection = None
+    application.prepare_candidate = lambda state, iterations: None
+    selection = MpcTargetSelection(
+        candidate_index=1,
+        position_m=torch.tensor([0.11, 0.2, 0.3]),
+        quaternion_wxyz=torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        joint_state=_state(0.4),
+    )
+    application._solve_target_ik = lambda state: selection
+
+    joint = application.set_target(
+        torch.tensor([0.1, 0.2, 0.3]), torch.tensor([1.0, 0.0, 0.0, 0.0])
+    )
+
+    assert joint is selection.joint_state
+    assert application.solver.position.flatten().tolist() == pytest.approx(
+        [0.11, 0.2, 0.3]
+    )
+    assert application.last_target_selection is selection
 
 
 def test_exposes_complete_infeasible_horizon_without_advancing_state() -> None:
