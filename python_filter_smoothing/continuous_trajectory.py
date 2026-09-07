@@ -247,6 +247,10 @@ class MpcTargetSelection:
     joint_state: JointState
 
 
+class CartesianTargetIkError(RuntimeError):
+    """A Cartesian goal has no IK solution accepted by configured constraints."""
+
+
 class ContinuousMpcTrajectory:
     """Convert successive Cartesian goals into complete q/dq/ddq horizons."""
 
@@ -281,10 +285,7 @@ class ContinuousMpcTrajectory:
                 len(self._ik_position_offsets_m),
             )
             if self._use_ik_joint_reference
-            and (
-                self._ik_fallback_seeds > 1
-                or len(self._ik_position_offsets_m) > 1
-            )
+            and (self._ik_fallback_seeds > 1 or len(self._ik_position_offsets_m) > 1)
             else None
         )
         self._setup_cold_start_iterations = _positive_iterations(
@@ -334,6 +335,18 @@ class ContinuousMpcTrajectory:
         return JointState.from_position(
             self.solver.default_joint_position.clone().unsqueeze(0),
             joint_names=self.joint_names,
+        )
+
+    def tool_pose(self, state: JointState) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the primary tool position and WXYZ quaternion for one state."""
+
+        poses = self.solver.compute_kinematics(state).tool_poses.to_dict()
+        pose = poses[self.solver.tool_frames[0]]
+        if pose.position is None or pose.quaternion is None:
+            raise RuntimeError("primary tool pose is unavailable")
+        return (
+            pose.position.reshape(-1, 3)[0].clone(),
+            pose.quaternion.reshape(-1, 4)[0].clone(),
         )
 
     def setup(self, initial_state: JointState) -> None:
@@ -431,9 +444,7 @@ class ContinuousMpcTrajectory:
                 bounds = self.solver.transition_model.get_state_bounds().position
                 scale = (bounds[1] - bounds[0]).clamp_min(1.0e-6)
                 distance = torch.sum(
-                    torch.square(
-                        (solutions - current.position.reshape(1, -1)) / scale
-                    ),
+                    torch.square((solutions - current.position.reshape(1, -1)) / scale),
                     dim=-1,
                 )
                 distance[~success[candidate_index]] = torch.inf
@@ -442,11 +453,31 @@ class ContinuousMpcTrajectory:
 
         position_error = float(result.position_error.min().item())
         rotation_error = float(result.rotation_error.min().item())
-        raise RuntimeError(
+        raise CartesianTargetIkError(
             "Cartesian goal IK failed "
             f"(position_error={position_error:.6g} m, "
             f"rotation_error={rotation_error:.6g} rad)"
         )
+
+    def try_target_ik(
+        self,
+        position_m: torch.Tensor,
+        quaternion_wxyz: torch.Tensor,
+    ) -> MpcTargetSelection | None:
+        """Return a validated IK target without changing the active MPC objective."""
+
+        if self._goal_request is None:
+            raise RuntimeError("setup() must be called before try_target_ik()")
+        current = self._planner.current_state
+        goal = self._goal_request
+        goal.position[:, :, 0, :, :].copy_(position_m.reshape(1, 1, 1, 3))
+        goal.quaternion[:, :, 0, :, :].copy_(quaternion_wxyz.reshape(1, 1, 1, 4))
+        try:
+            selection = self._solve_target_ik(current)
+        except CartesianTargetIkError:
+            return None
+        self._last_target_selection = selection
+        return selection
 
     def set_target(
         self,
@@ -454,34 +485,60 @@ class ContinuousMpcTrajectory:
         quaternion_wxyz: torch.Tensor | None = None,
         *,
         validate_ik: bool = False,
+        joint_reference: JointState | None = None,
     ) -> JointState | None:
         """Update a Cartesian target and prepare its first independent solve.
 
         With ``validate_ik=True``, only resolve and return IK without changing the
-        active MPC objective.  The configured runtime path instead installs that
-        IK result as both a joint reference and, optionally, an optimizer seed.
+        active MPC objective. A caller that already validated IK may pass the
+        resulting state as ``joint_reference`` to avoid solving the same pose
+        again. The configured runtime path installs the selected state as both a
+        joint reference and, optionally, an optimizer seed.
         """
 
         if self._goal_request is None:
             raise RuntimeError("setup() must be called before set_target()")
+        if validate_ik and joint_reference is not None:
+            raise ValueError("validate_ik and joint_reference are mutually exclusive")
         current = self._planner.current_state
         goal = self._goal_request
         goal.position[:, :, 0, :, :].copy_(position_m.reshape(1, 1, 1, 3))
         if quaternion_wxyz is not None:
             goal.quaternion[:, :, 0, :, :].copy_(quaternion_wxyz.reshape(1, 1, 1, 4))
-        selection = (
-            self._solve_target_ik(current)
-            if validate_ik or self._use_ik_joint_reference
-            else None
-        )
+        if joint_reference is not None:
+            reference_position = joint_reference.position
+            if (
+                not isinstance(reference_position, torch.Tensor)
+                or reference_position.numel() != len(self.joint_names)
+                or not bool(torch.all(torch.isfinite(reference_position)).item())
+            ):
+                raise ValueError("joint_reference must contain one finite joint state")
+            if (
+                joint_reference.joint_names is not None
+                and list(joint_reference.joint_names) != self.joint_names
+            ):
+                raise ValueError("joint_reference must use the controller joint order")
+            selection = MpcTargetSelection(
+                candidate_index=0,
+                position_m=goal.position[0, 0, 0, 0].clone(),
+                quaternion_wxyz=goal.quaternion[0, 0, 0, 0].clone(),
+                joint_state=JointState.from_position(
+                    reference_position.reshape(1, -1).clone(),
+                    joint_names=self.joint_names,
+                ),
+            )
+        else:
+            selection = (
+                self._solve_target_ik(current)
+                if validate_ik or self._use_ik_joint_reference
+                else None
+            )
         joint_reference = selection.joint_state if selection is not None else None
         self._last_target_selection = selection
         if validate_ik:
             return joint_reference
         if selection is not None:
-            goal.position[:, :, 0, 0, :].copy_(
-                selection.position_m.reshape(1, 1, 3)
-            )
+            goal.position[:, :, 0, 0, :].copy_(selection.position_m.reshape(1, 1, 3))
             goal.quaternion[:, :, 0, 0, :].copy_(
                 selection.quaternion_wxyz.reshape(1, 1, 4)
             )

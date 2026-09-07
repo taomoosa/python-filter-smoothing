@@ -103,7 +103,7 @@ Most adaptations should only need these YAML groups:
 | `cspace_bound_weight` | soft costs for position/velocity/acceleration/jerk/effort bounds |
 | `squared_l2_regularization_weight` | velocity/acceleration/jerk/torque/energy smoothness; weaken cautiously because reversals can increase |
 | `target_update` | independent iteration checkpoints, IK reference/seed, fallback seed count, and nearby IK poses |
-| `application` | queue connection delay, physical acceptance, and progress gate |
+| `application` | automatic target resolution, queue connection delay, physical acceptance, and progress gate |
 | `resampling` | servo-rate interpolation and filter duration; keep generation limits at or below 1.0 initially |
 
 Joint derivative limits come from the cuRobo robot YAML `cspace` section; the
@@ -127,6 +127,28 @@ in `optimizer.target_update.candidate_iterations` are independent cold solves.
 The application archives every feasible result and ranks feasible candidates by
 terminal pose error; a later infeasible solve therefore cannot erase an earlier
 safe result.
+
+`CartesianTargetResolver` keeps target fallback out of mechanism-specific calling
+code. It first validates the requested pose. If collision-aware IK rejects it, the
+resolver searches the segment from the requested pose toward the current,
+collision-free tool pose, refines the first feasible boundary, and retreats by
+`application.target_resolution.clearance_m`. Requested orientation is retained
+when possible and relaxed toward the current orientation only in the configured
+`orientation_fractions` order. The selected pose and already validated joint
+reference are installed together, so IK is not repeated. `long_mpc_example.py`
+uses this resolver by default and records the selected proxy, retreat distance,
+orientation fraction, and IK attempt count in its artifacts.
+
+```python
+resolution = target_resolver.set_target(
+    controller, current_state, requested_position, requested_quaternion
+)
+```
+
+This is a safe fallback policy, not a global Cartesian planner: it searches one
+line segment and may conservatively return a point near the current pose. Disable
+it with `application.target_resolution.enabled: false` when upstream guarantees
+that every requested pose must be reached exactly.
 
 Selection, progress checks, final validation, and command publication remain in
 the application. `application.execution_mode` selects `future_queue` (the verified

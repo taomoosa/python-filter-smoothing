@@ -165,9 +165,7 @@ def test_nearby_ik_uses_first_solvable_offset_and_nearest_joint_branch() -> None
         def solve_pose(self, **kwargs: object) -> SimpleNamespace:
             self.goal = kwargs["goal_tool_poses"]
             return SimpleNamespace(
-                success=torch.tensor(
-                    [[False, False], [True, True], [True, True]]
-                ),
+                success=torch.tensor([[False, False], [True, True], [True, True]]),
                 solution=torch.tensor(
                     [[[0.0], [0.0]], [[0.8], [0.3]], [[-0.1], [-0.2]]]
                 ),
@@ -210,6 +208,8 @@ def test_nearby_ik_uses_first_solvable_offset_and_nearest_joint_branch() -> None
 
 def test_selected_nearby_pose_becomes_the_mpc_target() -> None:
     class TargetSolver:
+        joint_names: ClassVar[list[str]] = ["j1"]
+
         def update_goal_tool_poses(self, goal: GoalToolPose, *, run_ik: bool) -> bool:
             assert not run_ik
             self.position = goal.position.clone()
@@ -245,6 +245,45 @@ def test_selected_nearby_pose_becomes_the_mpc_target() -> None:
         [0.11, 0.2, 0.3]
     )
     assert application.last_target_selection is selection
+
+
+def test_prevalidated_joint_reference_skips_redundant_ik() -> None:
+    class TargetSolver:
+        joint_names: ClassVar[list[str]] = ["j1"]
+
+        def update_goal_tool_poses(self, goal: GoalToolPose, *, run_ik: bool) -> bool:
+            assert not run_ik
+            self.position = goal.position.clone()
+            return True
+
+    application = ContinuousMpcTrajectory.__new__(ContinuousMpcTrajectory)
+    application.solver = TargetSolver()
+    application._planner = SimpleNamespace(current_state=_state())
+    application._goal_request = GoalToolPose(
+        tool_frames=["tool"],
+        position=torch.zeros((1, 1, 1, 1, 3)),
+        quaternion=torch.tensor([[[[[1.0, 0.0, 0.0, 0.0]]]]]),
+    )
+    application._candidate_iterations = (50,)
+    application._use_ik_joint_reference = True
+    application._joint_reference_state = None
+    application._last_target_selection = None
+    application.prepare_candidate = lambda state, iterations: None
+    application._solve_target_ik = lambda state: (_ for _ in ()).throw(
+        AssertionError("IK must not run")
+    )
+
+    joint = application.set_target(
+        torch.tensor([0.1, 0.2, 0.3]),
+        torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        joint_reference=_state(0.4),
+    )
+
+    assert joint is not None
+    assert joint.position.item() == pytest.approx(0.4)
+    assert application.solver.position.flatten().tolist() == pytest.approx(
+        [0.1, 0.2, 0.3]
+    )
 
 
 def test_exposes_complete_infeasible_horizon_without_advancing_state() -> None:

@@ -32,6 +32,19 @@ application:
   planning_connection_delay_s: 0.250
   # Used to advance an old path between failed retries in immediate mode.
   failed_plan_retry_period_s: 0.050
+  target_resolution:
+    # Try the requested pose first. If IK rejects it, automatically search from
+    # that pose toward the current collision-free tool pose.
+    enabled: true
+    # Coarse samples bound IK calls; bisection then moves the proxy closer to the
+    # requested pose. Search cost is paid only when the exact target fails.
+    coarse_position_samples: 8
+    refinement_iterations: 4
+    # Move this far toward the current pose after finding the IK-feasible edge.
+    clearance_m: 0.020
+    # Preserve requested orientation first. Lower fractions interpolate toward
+    # the current orientation and are tried only if the stricter search fails.
+    orientation_fractions: [1.0, 0.75, 0.50, 0.0]
   constraint_acceptance:
     # strict: require cuRobo cspace/self/scene constraints.
     # physical_limits: replace only cspace with the explicit checks below;

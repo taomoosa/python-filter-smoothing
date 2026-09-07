@@ -19,12 +19,15 @@ from curobo.types import JointState, Pose, RobotState
 
 from python_filter_smoothing.continuous_trajectory import ContinuousMpcTrajectory
 from python_filter_smoothing.mpc_application import (
+    CartesianTargetResolver,
     CspaceAcceptanceMode,
     JointLimitEvaluation,
     MpcCommandApplication,
     PoseError,
     PoseProgressPolicy,
     ProgressEvaluation,
+    TargetResolution,
+    TargetResolutionError,
     TrajectoryConstraintPolicy,
     TrajectoryExecutionMode,
     evaluate_joint_trajectory_limits,
@@ -42,8 +45,7 @@ from python_filter_smoothing.trajectory_resampling import (
 )
 
 DEFAULT_CONFIG = (
-    Path(__file__).parent
-    / "python_filter_smoothing/configs/long_mpc_application.yml"
+    Path(__file__).parent / "python_filter_smoothing/configs/long_mpc_application.yml"
 )
 
 
@@ -122,6 +124,7 @@ class _GeneratedPath:
     native_full_horizon_feasible: bool
     selected_target_candidate_index: int | None
     selected_target_offset_m: tuple[float, float, float] | None
+    target_resolution: TargetResolution
 
 
 @dataclass(frozen=True)
@@ -177,9 +180,9 @@ def _as_command_state(
         torch.as_tensor(trajectory.position, device=device, dtype=dtype)[None],
         joint_names=joint_names,
     )
-    state.velocity = torch.as_tensor(
-        trajectory.velocity, device=device, dtype=dtype
-    )[None]
+    state.velocity = torch.as_tensor(trajectory.velocity, device=device, dtype=dtype)[
+        None
+    ]
     state.acceleration = torch.as_tensor(
         trajectory.acceleration, device=device, dtype=dtype
     )[None]
@@ -240,7 +243,9 @@ def _targets(
     if not isinstance(rotation, torch.Tensor):
         raise TypeError("initial tool pose is missing rotation")
     offsets = torch.as_tensor(
-        options["target_offsets_m"], device=pose.position.device, dtype=pose.position.dtype
+        options["target_offsets_m"],
+        device=pose.position.device,
+        dtype=pose.position.dtype,
     )
     rotations = torch.as_tensor(
         options["target_rotation_offsets_rot6d"],
@@ -276,7 +281,9 @@ def _state_error(
         controller.solver.tool_frames[0]
     ]
     position_error = float(
-        torch.linalg.vector_norm(pose.position.reshape(-1, 3)[0] - target_position).item()
+        torch.linalg.vector_norm(
+            pose.position.reshape(-1, 3)[0] - target_position
+        ).item()
     )
     actual_quaternion = pose.quaternion.reshape(-1, 4)[0]
     quaternion_dot = torch.abs(torch.dot(actual_quaternion, target_quaternion))
@@ -348,9 +355,7 @@ def main() -> None:
     controller = ContinuousMpcTrajectory(mpc_config_path)
     initial = _initial_state(controller, options)
     controller.setup(initial)
-    target_position, target_quaternion, offsets = _targets(
-        controller, options, initial
-    )
+    target_position, target_quaternion, offsets = _targets(controller, options, initial)
 
     servo_dt = float(options["servo_dt_s"])
     duration_s = float(args.duration or options["duration_s"])
@@ -383,6 +388,9 @@ def main() -> None:
         raise ValueError("failed_plan_retry_period_s must be a positive servo multiple")
     progress_policy = PoseProgressPolicy.from_mapping(
         application_options.get("progress", {})
+    )
+    target_resolver = CartesianTargetResolver.from_mapping(
+        application_options.get("target_resolution", {})
     )
     constraint_options = dict(application_options.get("constraint_acceptance", {}))
     if args.cspace_acceptance is not None:
@@ -426,9 +434,15 @@ def main() -> None:
 
     def generate(target_index: int, start: JointState) -> _GeneratedPath:
         controller.setup(start)
-        controller.set_target(
-            target_position[target_index], target_quaternion[target_index]
-        )
+        try:
+            target_resolution = target_resolver.set_target(
+                controller,
+                start,
+                target_position[target_index],
+                target_quaternion[target_index],
+            )
+        except TargetResolutionError as error:
+            raise _PathGenerationError("target_resolution", str(error)) from error
         target_selection = controller.last_target_selection
         initial_pose_error = _state_error(
             controller,
@@ -447,9 +461,7 @@ def main() -> None:
                 target_position[target_index],
                 target_quaternion[target_index],
             )
-            progress = progress_policy.evaluate(
-                initial_pose_error, terminal_pose_error
-            )
+            progress = progress_policy.evaluate(initial_pose_error, terminal_pose_error)
             candidates.append(
                 _RawCandidate(
                     iterations,
@@ -487,13 +499,9 @@ def main() -> None:
             )
             names = ("position", "velocity", "acceleration")
             nodes = connect_initial_state_to_horizon(
+                tuple(getattr(start, name)[0].detach().cpu().numpy() for name in names),
                 tuple(
-                    getattr(start, name)[0].detach().cpu().numpy()
-                    for name in names
-                ),
-                tuple(
-                    getattr(source, name)[0].detach().cpu().numpy()
-                    for name in names
+                    getattr(source, name)[0].detach().cpu().numpy() for name in names
                 ),
             )
             try:
@@ -535,9 +543,7 @@ def main() -> None:
                 continue
             node_error = float(
                 np.max(
-                    np.abs(
-                        resampled.position[resampled.node_sample_indices] - nodes[0]
-                    )
+                    np.abs(resampled.position[resampled.node_sample_indices] - nodes[0])
                 )
             )
             changes = tuple(
@@ -556,12 +562,9 @@ def main() -> None:
                 constraint_violations=violations,
                 maximum_constraint_values=maxima,
                 maximum_node_error_rad=node_error,
-                source_duration_s=(len(nodes[0]) - 1)
-                * controller.timing.command_dt_s,
+                source_duration_s=(len(nodes[0]) - 1) * controller.timing.command_dt_s,
                 initial_state_errors=initial_errors,
-                raw_max_jerk_rad_s3=_maximum_jerk(
-                    resampled.raw_acceleration, servo_dt
-                ),
+                raw_max_jerk_rad_s3=_maximum_jerk(resampled.raw_acceleration, servo_dt),
                 filtered_max_jerk_rad_s3=_maximum_jerk(
                     resampled.acceleration, servo_dt
                 ),
@@ -580,9 +583,7 @@ def main() -> None:
                     PoseError(selected.position_error_m, selected.rotation_error_rad),
                 ),
                 joint_limits=joint_limits,
-                native_full_horizon_feasible=(
-                    selected.horizon.full_horizon_feasible
-                ),
+                native_full_horizon_feasible=(selected.horizon.full_horizon_feasible),
                 selected_target_candidate_index=(
                     target_selection.candidate_index
                     if target_selection is not None
@@ -592,8 +593,7 @@ def main() -> None:
                     tuple(
                         float(value)
                         for value in (
-                            target_selection.position_m
-                            - target_position[target_index]
+                            target_selection.position_m - target_position[target_index]
                         )
                         .detach()
                         .cpu()
@@ -602,10 +602,11 @@ def main() -> None:
                     if target_selection is not None
                     else None
                 ),
+                target_resolution=target_resolution,
             )
         raise _PathGenerationError(
             "final_validation",
-            f"long MPC target {target_index} had no candidate passing final validation"
+            f"long MPC target {target_index} had no candidate passing final validation",
         )
 
     startup_started = time.perf_counter()
@@ -700,16 +701,12 @@ def main() -> None:
                     produced * servo_dt,
                     float(target_index),
                     candidate.mpc_wall_time_s if candidate else math.nan,
-                    candidate.selected_candidate_iterations
-                    if candidate
-                    else math.nan,
+                    candidate.selected_candidate_iterations if candidate else math.nan,
                     float(sum(candidate.candidate_feasible)) if candidate else 0.0,
                     candidate.resampled.interpolation_wall_time_s
                     if candidate
                     else math.nan,
-                    candidate.resampled.filter_wall_time_s
-                    if candidate
-                    else math.nan,
+                    candidate.resampled.filter_wall_time_s if candidate else math.nan,
                     candidate.validation_wall_time_s if candidate else math.nan,
                     application_wall,
                     float(elapsed_samples),
@@ -717,19 +714,13 @@ def main() -> None:
                     float(candidate is not None),
                     float(accepted),
                     candidate.resampled.duration_s if candidate else math.nan,
-                    candidate.initial_pose_error.position_m
-                    if candidate
-                    else math.nan,
-                    candidate.terminal_pose_error.position_m
-                    if candidate
-                    else math.nan,
+                    candidate.initial_pose_error.position_m if candidate else math.nan,
+                    candidate.terminal_pose_error.position_m if candidate else math.nan,
                     candidate.progress.position_improvement_m
                     if candidate
                     else math.nan,
                     float(candidate.progress.accepted) if candidate else 0.0,
-                    float(candidate.native_full_horizon_feasible)
-                    if candidate
-                    else 0.0,
+                    float(candidate.native_full_horizon_feasible) if candidate else 0.0,
                     candidate.joint_limits.maximum_velocity_ratio
                     if candidate
                     else math.nan,
@@ -742,10 +733,22 @@ def main() -> None:
                     float(candidate.constraint_violations.get("cspace", 0))
                     if candidate
                     else 0.0,
+                    float(candidate.target_resolution.used_proxy) if candidate else 0.0,
+                    float(candidate.target_resolution.ik_attempts)
+                    if candidate
+                    else 0.0,
+                    candidate.target_resolution.retreat_distance_m
+                    if candidate
+                    else math.nan,
+                    candidate.target_resolution.orientation_fraction
+                    if candidate
+                    else math.nan,
                 ]
             )
             continue
-        boundary = min(total_samples, ((produced // target_samples) + 1) * target_samples)
+        boundary = min(
+            total_samples, ((produced // target_samples) + 1) * target_samples
+        )
         append(application.consume(boundary - produced))
 
     q, dq, ddq = map(torch.cat, (q_parts, dq_parts, ddq_parts))
@@ -764,7 +767,9 @@ def main() -> None:
     if tool_position.shape[0] != len(q):
         raise RuntimeError("forward kinematics returned an unexpected trajectory shape")
 
-    output = args.output or _config_path(options["output_directory"], config_path.parent)
+    output = args.output or _config_path(
+        options["output_directory"], config_path.parent
+    )
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     columns = (
@@ -787,21 +792,27 @@ def main() -> None:
             "target_qz",
         ]
     )
-    values = torch.cat(
-        (
-            time_s[:, None],
-            target_tensor.to(q.dtype)[:, None],
-            q,
-            dq,
-            ddq,
-            jerk,
-            tool_position,
-            desired_position,
-            desired_quaternion,
-        ),
-        dim=1,
-    ).cpu().numpy()
-    np.savetxt(output / "trajectory.csv", values, delimiter=",", header=",".join(columns))
+    values = (
+        torch.cat(
+            (
+                time_s[:, None],
+                target_tensor.to(q.dtype)[:, None],
+                q,
+                dq,
+                ddq,
+                jerk,
+                tool_position,
+                desired_position,
+                desired_quaternion,
+            ),
+            dim=1,
+        )
+        .cpu()
+        .numpy()
+    )
+    np.savetxt(
+        output / "trajectory.csv", values, delimiter=",", header=",".join(columns)
+    )
     update_columns = [
         "publish_time_s",
         "target_index",
@@ -826,6 +837,10 @@ def main() -> None:
         "maximum_acceleration_ratio",
         "maximum_jerk_ratio",
         "curobo_cspace_positive_samples",
+        "target_proxy_used",
+        "target_resolution_ik_attempts",
+        "target_retreat_distance_m",
+        "target_orientation_fraction",
     ]
     np.savetxt(
         output / "planner_updates.csv",
@@ -850,14 +865,22 @@ def main() -> None:
         "duration_s": len(q) * servo_dt,
         "command_dt_s": servo_dt,
         "optimizer_execution": {
-            "setup_cold_iterations": controller.config["optimizer"]["cold_start_iterations"],
+            "setup_cold_iterations": controller.config["optimizer"][
+                "cold_start_iterations"
+            ],
             "candidate_iterations": list(controller.candidate_iterations),
             "warm_iterations": controller.config["optimizer"]["warm_start_iterations"],
             "fixed_iterations": controller.config["optimizer"]["fixed_iterations"],
             "return_best_action": controller.config["optimizer"]["return_best_action"],
-            "use_ik_joint_reference": controller.config["optimizer"]["target_update"]["use_ik_joint_reference"],
-            "seed_from_ik": controller.config["optimizer"]["target_update"]["seed_from_ik"],
-            "ik_fallback_seeds": controller.config["optimizer"]["target_update"]["ik_fallback_seeds"],
+            "use_ik_joint_reference": controller.config["optimizer"]["target_update"][
+                "use_ik_joint_reference"
+            ],
+            "seed_from_ik": controller.config["optimizer"]["target_update"][
+                "seed_from_ik"
+            ],
+            "ik_fallback_seeds": controller.config["optimizer"]["target_update"][
+                "ik_fallback_seeds"
+            ],
             "ik_position_offsets_m": controller.config["optimizer"][
                 "target_update"
             ].get("ik_position_offsets_m", [[0.0, 0.0, 0.0]]),
@@ -907,6 +930,29 @@ def main() -> None:
             "minimum_rotation_improvement_rad": progress_policy.minimum_rotation_improvement_rad,
             "rotation_tolerance_rad": progress_policy.rotation_tolerance_rad,
         },
+        "target_resolution_policy": {
+            "enabled": target_resolver.policy.enabled,
+            "coarse_position_samples": (target_resolver.policy.coarse_position_samples),
+            "refinement_iterations": target_resolver.policy.refinement_iterations,
+            "clearance_m": target_resolver.policy.clearance_m,
+            "orientation_fractions": list(target_resolver.policy.orientation_fractions),
+        },
+        "target_resolutions": [
+            {
+                "used_proxy": item.target_resolution.used_proxy,
+                "reason": item.target_resolution.reason,
+                "ik_attempts": item.target_resolution.ik_attempts,
+                "retreat_distance_m": item.target_resolution.retreat_distance_m,
+                "orientation_fraction": (item.target_resolution.orientation_fraction),
+                "selected_position_m": (
+                    item.target_resolution.selected.position_m.cpu().tolist()
+                ),
+            }
+            for item in generated
+        ],
+        "proxy_target_paths": sum(
+            item.target_resolution.used_proxy for item in generated
+        ),
         "constraint_acceptance_policy": {
             "cspace_mode": constraint_policy.cspace_mode.value,
             "maximum_velocity_ratio": constraint_policy.maximum_velocity_ratio,
@@ -951,18 +997,26 @@ def main() -> None:
         ),
         "curobo_constraint_violations_by_component": {
             name: sum(item.constraint_violations.get(name, 0) for item in generated)
-            for name in sorted({name for item in generated for name in item.constraint_violations})
+            for name in sorted(
+                {name for item in generated for name in item.constraint_violations}
+            )
         },
         "curobo_maximum_constraint_by_component": {
-            name: max(item.maximum_constraint_values.get(name, 0.0) for item in generated)
-            for name in sorted({name for item in generated for name in item.maximum_constraint_values})
+            name: max(
+                item.maximum_constraint_values.get(name, 0.0) for item in generated
+            )
+            for name in sorted(
+                {name for item in generated for name in item.maximum_constraint_values}
+            )
         },
         "max_filtered_long_mpc_node_position_error_rad": max(
             item.maximum_node_error_rad for item in generated
         ),
         "max_initial_long_state_error": {
             name: max(item.initial_state_errors[index] for item in generated)
-            for index, name in enumerate(("position_rad", "velocity_rad_s", "acceleration_rad_s2"))
+            for index, name in enumerate(
+                ("position_rad", "velocity_rad_s", "acceleration_rad_s2")
+            )
         },
         "path_duration_s": [item.resampled.duration_s for item in generated],
         "duration_scale_vs_long_mpc": [
@@ -982,7 +1036,9 @@ def main() -> None:
         ),
         "max_filter_change": {
             name: max(item.filter_changes[index] for item in generated)
-            for index, name in enumerate(("position_rad", "velocity_rad_s", "acceleration_rad_s2"))
+            for index, name in enumerate(
+                ("position_rad", "velocity_rad_s", "acceleration_rad_s2")
+            )
         },
         "max_joint_displacement_l2_rad": float(
             torch.linalg.vector_norm(q - q[0], dim=1).max().item()
@@ -1002,7 +1058,9 @@ def main() -> None:
             "maximum": float(errors.max().item()),
             "final": float(errors[-1].item()),
             "completed_segment_end_median": (
-                float(torch.median(completed_errors).item()) if len(completed_errors) else None
+                float(torch.median(completed_errors).item())
+                if len(completed_errors)
+                else None
             ),
             "completed_segment_end_maximum": (
                 float(completed_errors.max().item()) if len(completed_errors) else None

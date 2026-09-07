@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from curobo.types import JointState
 
 from python_filter_smoothing.mpc_application import (
+    CartesianTargetResolver,
     CspaceAcceptanceMode,
     MpcCommandApplication,
     PoseError,
     PoseProgressPolicy,
+    TargetResolutionError,
+    TargetResolutionPolicy,
     TrajectoryConstraintPolicy,
     evaluate_joint_trajectory_limits,
 )
@@ -21,6 +26,55 @@ def _trajectory(values: list[float]) -> JointState:
     state.acceleration = torch.zeros_like(position)
     state.jerk = torch.zeros_like(position)
     return state
+
+
+class _TargetController:
+    def __init__(self, minimum_feasible_x: float) -> None:
+        self.minimum_feasible_x = minimum_feasible_x
+        self.last_target_selection = None
+        self.validation_count = 0
+        self.installed_position: torch.Tensor | None = None
+        self.installed_joint: JointState | None = None
+
+    def tool_pose(self, state: JointState) -> tuple[torch.Tensor, torch.Tensor]:
+        del state
+        return torch.tensor([1.0, 0.0, 0.0]), torch.tensor([1.0, 0.0, 0.0, 0.0])
+
+    def try_target_ik(
+        self,
+        position_m: torch.Tensor,
+        quaternion_wxyz: torch.Tensor,
+    ) -> SimpleNamespace | None:
+        self.validation_count += 1
+        if float(position_m[0]) < self.minimum_feasible_x:
+            return None
+        joint = _trajectory([float(position_m[0])])
+        selection = SimpleNamespace(
+            position_m=position_m.clone(),
+            quaternion_wxyz=quaternion_wxyz.clone(),
+            joint_state=joint,
+        )
+        self.last_target_selection = selection
+        return selection
+
+    def set_target(
+        self,
+        position_m: torch.Tensor,
+        quaternion_wxyz: torch.Tensor | None = None,
+        *,
+        validate_ik: bool = False,
+        joint_reference: JointState | None = None,
+    ) -> JointState | None:
+        assert quaternion_wxyz is not None
+        assert not validate_ik
+        assert joint_reference is not None
+        self.installed_position = position_m.clone()
+        self.installed_joint = joint_reference
+        self.last_target_selection = SimpleNamespace(
+            position_m=position_m.clone(),
+            quaternion_wxyz=quaternion_wxyz.clone(),
+        )
+        return joint_reference
 
 
 def test_progress_accepts_improvement_or_target_tolerance() -> None:
@@ -76,9 +130,7 @@ def test_future_queue_keeps_executing_old_path_during_plan() -> None:
 
 
 def test_immediate_mode_ignores_planning_time_and_replaces_now() -> None:
-    application = MpcCommandApplication(
-        _trajectory([0.0, 1.0, 2.0]), mode="immediate"
-    )
+    application = MpcCommandApplication(_trajectory([0.0, 1.0, 2.0]), mode="immediate")
     plan = application.begin_plan()
 
     assert application.consume_during_planning(10) is None
@@ -134,3 +186,87 @@ def test_joint_limit_policy_can_allow_five_percent_discrete_jerk() -> None:
     assert strict.reason == "jerk_limit"
     assert relaxed.accepted
     assert relaxed.maximum_jerk_ratio == pytest.approx(1.04)
+
+
+def test_target_resolver_installs_exact_ik_target_without_search() -> None:
+    controller = _TargetController(minimum_feasible_x=0.4)
+    resolver = CartesianTargetResolver()
+
+    result = resolver.set_target(
+        controller,
+        _trajectory([0.0]),
+        torch.tensor([0.6, 0.0, 0.0]),
+        torch.tensor([1.0, 0.0, 0.0, 0.0]),
+    )
+
+    assert not result.used_proxy
+    assert result.reason == "exact"
+    assert result.ik_attempts == 1
+    assert controller.validation_count == 1
+    torch.testing.assert_close(
+        controller.installed_position, torch.tensor([0.6, 0.0, 0.0])
+    )
+
+
+def test_target_resolver_finds_nearest_proxy_then_adds_clearance() -> None:
+    controller = _TargetController(minimum_feasible_x=0.4)
+    resolver = CartesianTargetResolver(
+        TargetResolutionPolicy(
+            coarse_position_samples=4,
+            refinement_iterations=2,
+            clearance_m=0.1,
+            orientation_fractions=(1.0,),
+        )
+    )
+
+    result = resolver.set_target(
+        controller,
+        _trajectory([0.0]),
+        torch.tensor([0.0, 0.0, 0.0]),
+        torch.tensor([1.0, 0.0, 0.0, 0.0]),
+    )
+
+    assert result.used_proxy
+    assert result.reason == "proxy"
+    assert result.ik_attempts == 6
+    assert result.retreat_distance_m == pytest.approx(0.5375)
+    assert result.orientation_fraction == pytest.approx(1.0)
+    torch.testing.assert_close(
+        controller.installed_position, torch.tensor([0.5375, 0.0, 0.0])
+    )
+    assert controller.installed_joint is result.selected.joint_state
+
+
+def test_target_resolver_can_disable_proxy_search() -> None:
+    controller = _TargetController(minimum_feasible_x=0.4)
+    resolver = CartesianTargetResolver(TargetResolutionPolicy(enabled=False))
+
+    with pytest.raises(TargetResolutionError, match="disabled"):
+        resolver.set_target(
+            controller,
+            _trajectory([0.0]),
+            torch.tensor([0.0, 0.0, 0.0]),
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        )
+
+    assert controller.validation_count == 1
+    assert controller.installed_position is None
+
+
+@pytest.mark.parametrize(
+    "options",
+    (
+        {"coarse_position_samples": 0},
+        {"coarse_position_samples": 2.5},
+        {"refinement_iterations": -1},
+        {"clearance_m": -0.01},
+        {"orientation_fractions": []},
+        {"orientation_fractions": [1.1]},
+        {"orientation_fractions": [1.0, 1.0]},
+    ),
+)
+def test_target_resolution_policy_rejects_invalid_options(
+    options: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        TargetResolutionPolicy.from_mapping(options)
