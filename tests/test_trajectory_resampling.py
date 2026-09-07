@@ -31,13 +31,20 @@ def _options(method: str) -> dict[str, object]:
     }
 
 
-@pytest.mark.parametrize("method", ["hermite", "ruckig"])
-def test_resampler_is_selectable_and_respects_derivative_limits(method: str) -> None:
+@pytest.mark.parametrize(
+    ("method", "post_filter"),
+    [("hermite", "savgol_position"), ("ruckig", "savgol_position"), ("ruckig", "none")],
+)
+def test_resampler_is_selectable_and_respects_derivative_limits(
+    method: str, post_filter: str
+) -> None:
     q = np.asarray([[0.0], [0.01], [0.02], [0.025]])
     dq = np.asarray([[0.0], [0.1], [0.05], [0.0]])
     ddq = np.zeros_like(q)
     limits = (np.asarray([1.0]), np.asarray([10.0]), np.asarray([500.0]))
 
+    options = _options(method)
+    options["post_filter"]["method"] = post_filter
     result = resample_joint_trajectory(
         q,
         dq,
@@ -49,12 +56,15 @@ def test_resampler_is_selectable_and_respects_derivative_limits(method: str) -> 
         max_jerk=limits[2],
         min_position=np.asarray([-1.0]),
         max_position=np.asarray([1.0]),
-        options=_options(method),
+        options=options,
     )
 
     assert result.method == method
     assert result.position.shape == result.velocity.shape == result.acceleration.shape
     assert np.array_equal(result.position[[0, -1]], q[[0, -1]])
+    if post_filter == "none":
+        assert result.filter_wall_time_s == 0.0
+        assert np.array_equal(result.position, result.raw_position)
     ratios = derivative_limit_ratios(
         result.velocity, result.acceleration, 0.005, *limits
     )

@@ -123,8 +123,11 @@ def _filter(
     options: dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     settings = options["post_filter"]
-    if str(settings["method"]) != "savgol_position":
-        raise ValueError("resampling.post_filter.method must be savgol_position")
+    method = str(settings["method"])
+    if method == "none":
+        return position.copy(), velocity.copy(), acceleration.copy(), 0.0
+    if method != "savgol_position":
+        raise ValueError("resampling.post_filter.method must be none or savgol_position")
     started = time.perf_counter()
     result = filter_joint_trajectory_savgol(
         position,

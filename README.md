@@ -56,6 +56,12 @@ The maintained MPC example generates a long collision-aware cuRobo path and
 resamples it to 5 ms servo commands. Time-scaled cubic Hermite is the standard;
 state-to-state Ruckig remains selectable with `resampling.method: ruckig` in
 `python_filter_smoothing/configs/long_mpc_application.yml`.
+`application.path_generation.mode: direct_then_mpc` first tries a jerk-limited
+two-state Ruckig path to the resolver's IK solution, validates every sampled
+state, and falls back to collision-aware MPC when the direct path is unsafe.
+Use `mpc` to always plan with MPC or `direct_ruckig` to reject unsafe direct paths
+without fallback. Direct Ruckig output is validated without the MPC path's
+Savitzky–Golay post-filter because Ruckig already enforces derivative limits.
 It requires a CUDA-enabled cuRobo installation; the commands below assume its
 virtual environment is in the sibling `../curobo` checkout.
 

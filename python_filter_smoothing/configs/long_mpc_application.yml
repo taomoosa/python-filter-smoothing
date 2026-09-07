@@ -24,6 +24,11 @@ example:
 
 # These decisions belong to the application, not to cuRobo's MPC solver.
 application:
+  # Try a fast jerk-limited direct joint path first and use MPC only when its
+  # sampled path collides or fails the application limits/progress checks.
+  # Other choices: mpc, direct_ruckig.
+  path_generation:
+    mode: direct_then_mpc
   # future_queue executes the verified old path while MPC is calculating.
   # immediate ignores calculation time and is intended for offline/blocking use.
   execution_mode: future_queue

@@ -10,6 +10,7 @@ from python_filter_smoothing.mpc_application import (
     CartesianTargetResolver,
     CspaceAcceptanceMode,
     MpcCommandApplication,
+    PathGenerationMode,
     PoseError,
     PoseProgressPolicy,
     TargetResolutionError,
@@ -17,6 +18,14 @@ from python_filter_smoothing.mpc_application import (
     TrajectoryConstraintPolicy,
     evaluate_joint_trajectory_limits,
 )
+
+
+def test_path_generation_modes_exclude_direct_hermite() -> None:
+    assert {mode.value for mode in PathGenerationMode} == {
+        "mpc",
+        "direct_ruckig",
+        "direct_then_mpc",
+    }
 
 
 def _trajectory(values: list[float]) -> JointState:

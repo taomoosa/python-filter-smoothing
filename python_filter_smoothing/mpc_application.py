@@ -21,6 +21,14 @@ class TrajectoryExecutionMode(str, Enum):
     FUTURE_QUEUE = "future_queue"
 
 
+class PathGenerationMode(str, Enum):
+    """How the application obtains a validated joint trajectory."""
+
+    MPC = "mpc"
+    DIRECT_RUCKIG = "direct_ruckig"
+    DIRECT_THEN_MPC = "direct_then_mpc"
+
+
 class CspaceAcceptanceMode(str, Enum):
     """How the application interprets cuRobo's aggregate cspace constraint."""
 

@@ -23,6 +23,7 @@ from python_filter_smoothing.mpc_application import (
     CspaceAcceptanceMode,
     JointLimitEvaluation,
     MpcCommandApplication,
+    PathGenerationMode,
     PoseError,
     PoseProgressPolicy,
     ProgressEvaluation,
@@ -103,6 +104,7 @@ def _initial_state(
 
 @dataclass(frozen=True)
 class _GeneratedPath:
+    generation_method: str
     state: JointState
     mpc_wall_time_s: float
     resampled: ResampledJointTrajectory
@@ -321,6 +323,11 @@ def main() -> None:
         help="override application.execution_mode",
     )
     parser.add_argument(
+        "--path-generation",
+        choices=[mode.value for mode in PathGenerationMode],
+        help="override application.path_generation.mode",
+    )
+    parser.add_argument(
         "--cspace-acceptance",
         choices=[mode.value for mode in CspaceAcceptanceMode],
         help="override application.constraint_acceptance.cspace_mode",
@@ -368,6 +375,10 @@ def main() -> None:
         raise ValueError("target_period_s must be a positive servo multiple")
     execution_mode = TrajectoryExecutionMode(
         args.execution_mode or application_options["execution_mode"]
+    )
+    path_generation_mode = PathGenerationMode(
+        args.path_generation
+        or application_options.get("path_generation", {}).get("mode", "mpc")
     )
     connection_delay = float(application_options["planning_connection_delay_s"])
     connection_samples = round(connection_delay / servo_dt)
@@ -450,6 +461,161 @@ def main() -> None:
             target_position[target_index],
             target_quaternion[target_index],
         )
+
+        def finalize(
+            generation_method: str,
+            resampled: ResampledJointTrajectory,
+            nodes: tuple[np.ndarray, np.ndarray, np.ndarray],
+            source_duration_s: float,
+            initial_state_errors: tuple[float, float, float],
+            candidate_feasible: tuple[bool, ...],
+            selected_iterations: int,
+            native_feasible: bool,
+            mpc_wall_time_s: float,
+        ) -> _GeneratedPath | None:
+            state = _as_command_state(
+                resampled, start, controller.joint_names, servo_dt
+            )
+            validation_started = time.perf_counter()
+            valid, violations, maxima = _validate_with_curobo(
+                controller, state, constraint_policy.ignored_curobo_constraints
+            )
+            joint_limits = evaluate_joint_trajectory_limits(
+                state,
+                start,
+                dt_s=servo_dt,
+                minimum_position=bounds.position[0],
+                maximum_position=bounds.position[1],
+                maximum_velocity=nominal_velocity_limit,
+                maximum_acceleration=nominal_acceleration_limit,
+                maximum_jerk=nominal_jerk_limit,
+                policy=constraint_policy,
+            )
+            terminal_pose_error = _state_error(
+                controller,
+                JointState.from_position(
+                    state.position[:, -1], joint_names=controller.joint_names
+                ),
+                target_position[target_index],
+                target_quaternion[target_index],
+            )
+            progress = progress_policy.evaluate(
+                initial_pose_error, terminal_pose_error
+            )
+            if not valid or not joint_limits.accepted or not progress.accepted:
+                return None
+            return _GeneratedPath(
+                generation_method=generation_method,
+                state=state,
+                mpc_wall_time_s=mpc_wall_time_s,
+                resampled=resampled,
+                validation_wall_time_s=time.perf_counter() - validation_started,
+                constraint_violations=violations,
+                maximum_constraint_values=maxima,
+                maximum_node_error_rad=float(
+                    np.max(
+                        np.abs(
+                            resampled.position[resampled.node_sample_indices] - nodes[0]
+                        )
+                    )
+                ),
+                source_duration_s=source_duration_s,
+                initial_state_errors=initial_state_errors,
+                raw_max_jerk_rad_s3=_maximum_jerk(
+                    resampled.raw_acceleration, servo_dt
+                ),
+                filtered_max_jerk_rad_s3=_maximum_jerk(
+                    resampled.acceleration, servo_dt
+                ),
+                filter_changes=tuple(
+                    float(np.max(np.abs(filtered - raw)))
+                    for filtered, raw in (
+                        (resampled.position, resampled.raw_position),
+                        (resampled.velocity, resampled.raw_velocity),
+                        (resampled.acceleration, resampled.raw_acceleration),
+                    )
+                ),
+                candidate_feasible=candidate_feasible,
+                selected_candidate_iterations=selected_iterations,
+                initial_pose_error=initial_pose_error,
+                terminal_pose_error=terminal_pose_error,
+                progress=progress,
+                joint_limits=joint_limits,
+                native_full_horizon_feasible=native_feasible,
+                selected_target_candidate_index=(
+                    target_selection.candidate_index
+                    if target_selection is not None
+                    else None
+                ),
+                selected_target_offset_m=(
+                    tuple(
+                        float(value)
+                        for value in (
+                            target_selection.position_m - target_position[target_index]
+                        )
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    if target_selection is not None
+                    else None
+                ),
+                target_resolution=target_resolution,
+            )
+
+        if path_generation_mode is not PathGenerationMode.MPC:
+            target = target_resolution.selected.joint_state.position.reshape(-1)
+            names = ("position", "velocity", "acceleration")
+            start_nodes = [
+                getattr(start, name)[0].detach().cpu().numpy() for name in names
+            ]
+            direct_nodes = (
+                np.stack((start_nodes[0], target.detach().cpu().numpy())),
+                np.stack((start_nodes[1], np.zeros_like(start_nodes[1]))),
+                np.stack((start_nodes[2], np.zeros_like(start_nodes[2]))),
+            )
+            direct_options = {
+                **resampling_options,
+                "method": "ruckig",
+                "post_filter": {"method": "none"},
+            }
+            minimum_duration = controller.timing.command_dt_s
+            direct = None
+            direct_error = "final validation failed"
+            try:
+                direct = resample_joint_trajectory(
+                    *direct_nodes,
+                    source_dt_s=minimum_duration,
+                    sample_dt_s=servo_dt,
+                    max_velocity=numpy_limits[0],
+                    max_acceleration=numpy_limits[1],
+                    max_jerk=numpy_limits[2],
+                    min_position=numpy_limits[3],
+                    max_position=numpy_limits[4],
+                    options=direct_options,
+                )
+            except (RuntimeError, ValueError) as error:
+                direct_error = str(error)
+            if direct is not None:
+                result = finalize(
+                    "direct_ruckig",
+                    direct,
+                    direct_nodes,
+                    minimum_duration,
+                    (0.0, 0.0, 0.0),
+                    (True,),
+                    0,
+                    True,
+                    0.0,
+                )
+                if result is not None:
+                    return result
+            if path_generation_mode is PathGenerationMode.DIRECT_RUCKIG:
+                raise _PathGenerationError(
+                    "direct_validation",
+                    f"direct Ruckig target {target_index} failed: {direct_error}",
+                )
+
         candidates: list[_RawCandidate] = []
         for index, iterations in enumerate(controller.candidate_iterations):
             if index:
@@ -518,92 +684,21 @@ def main() -> None:
                 )
             except (RuntimeError, ValueError):
                 continue
-            state = _as_command_state(
-                resampled, start, controller.joint_names, servo_dt
-            )
-            validation_started = time.perf_counter()
-            valid, violations, maxima = _validate_with_curobo(
-                controller,
-                state,
-                constraint_policy.ignored_curobo_constraints,
-            )
-            joint_limits = evaluate_joint_trajectory_limits(
-                state,
-                start,
-                dt_s=servo_dt,
-                minimum_position=bounds.position[0],
-                maximum_position=bounds.position[1],
-                maximum_velocity=nominal_velocity_limit,
-                maximum_acceleration=nominal_acceleration_limit,
-                maximum_jerk=nominal_jerk_limit,
-                policy=constraint_policy,
-            )
-            validation_wall = time.perf_counter() - validation_started
-            if not valid or not joint_limits.accepted:
-                continue
-            node_error = float(
-                np.max(
-                    np.abs(resampled.position[resampled.node_sample_indices] - nodes[0])
-                )
-            )
-            changes = tuple(
-                float(np.max(np.abs(filtered - raw)))
-                for filtered, raw in (
-                    (resampled.position, resampled.raw_position),
-                    (resampled.velocity, resampled.raw_velocity),
-                    (resampled.acceleration, resampled.raw_acceleration),
-                )
-            )
-            return _GeneratedPath(
-                state=state,
-                mpc_wall_time_s=mpc_wall,
-                resampled=resampled,
-                validation_wall_time_s=validation_wall,
-                constraint_violations=violations,
-                maximum_constraint_values=maxima,
-                maximum_node_error_rad=node_error,
-                source_duration_s=(len(nodes[0]) - 1) * controller.timing.command_dt_s,
-                initial_state_errors=initial_errors,
-                raw_max_jerk_rad_s3=_maximum_jerk(resampled.raw_acceleration, servo_dt),
-                filtered_max_jerk_rad_s3=_maximum_jerk(
-                    resampled.acceleration, servo_dt
-                ),
-                filter_changes=changes,
-                candidate_feasible=tuple(
+            result = finalize(
+                "mpc",
+                resampled,
+                nodes,
+                (len(nodes[0]) - 1) * controller.timing.command_dt_s,
+                initial_errors,
+                tuple(
                     item.horizon.full_horizon_feasible for item in candidates
                 ),
-                selected_candidate_iterations=selected.iterations,
-                initial_pose_error=initial_pose_error,
-                terminal_pose_error=PoseError(
-                    selected.position_error_m, selected.rotation_error_rad
-                ),
-                progress=selected.progress
-                or progress_policy.evaluate(
-                    initial_pose_error,
-                    PoseError(selected.position_error_m, selected.rotation_error_rad),
-                ),
-                joint_limits=joint_limits,
-                native_full_horizon_feasible=(selected.horizon.full_horizon_feasible),
-                selected_target_candidate_index=(
-                    target_selection.candidate_index
-                    if target_selection is not None
-                    else None
-                ),
-                selected_target_offset_m=(
-                    tuple(
-                        float(value)
-                        for value in (
-                            target_selection.position_m - target_position[target_index]
-                        )
-                        .detach()
-                        .cpu()
-                        .tolist()
-                    )
-                    if target_selection is not None
-                    else None
-                ),
-                target_resolution=target_resolution,
+                selected.iterations,
+                selected.horizon.full_horizon_feasible,
+                mpc_wall,
             )
+            if result is not None:
+                return result
         raise _PathGenerationError(
             "final_validation",
             f"long MPC target {target_index} had no candidate passing final validation",
@@ -859,8 +954,11 @@ def main() -> None:
     completed_errors = errors[completed_segment_ends]
     method = str(resampling_options["method"])
     summary = {
-        "trajectory_generator": f"long_mpc_plus_{method}_savgol",
+        "trajectory_generator": path_generation_mode.value,
+        "path_generation_mode": path_generation_mode.value,
+        "generated_path_methods": [item.generation_method for item in generated],
         "resampling_method": method,
+        "generated_resampling_methods": [item.resampled.method for item in generated],
         "samples": len(q),
         "duration_s": len(q) * servo_dt,
         "command_dt_s": servo_dt,
