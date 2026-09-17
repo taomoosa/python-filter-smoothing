@@ -23,7 +23,9 @@ timing:
   control_points: 32
 
 optimizer:
-  base_config: mpc/lbfgs_mpc.yml
+  # Repository-owned cuRobo task/optimizer profile. Copy and tune it separately
+  # from this mechanism profile when changing L-BFGS implementation settings.
+  base_config: long_mpc_optimizer.yml
   # [translation, rotation]. Scale these for the task before copying collision
   # weights from another robot; absolute magnitudes are not portable.
   tool_pose_weight: [50000.0, 1000.0]

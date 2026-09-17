@@ -80,10 +80,12 @@ network.
 ### Adapting the example to another mechanism
 
 The example code has no fixed joint count or joint names. Start by copying
-`configs/long_mpc.yml` as the mechanism/optimizer profile and, when the start
-pose or targets differ, copy `configs/long_mpc_application.yml` as the application
-profile. Point its `long_mpc_config` at the first file, or override that path on
-the command line:
+`configs/long_mpc.yml` as the mechanism profile and, when the start pose or
+targets differ, copy `configs/long_mpc_application.yml` as the application
+profile. The mechanism profile references the repository-owned
+`configs/long_mpc_optimizer.yml`; copy that file only when the cuRobo optimizer
+implementation settings also need tuning. Point `long_mpc_config` at the
+mechanism profile, or override that path on the command line:
 
 ```bash
 ../curobo/.venv/bin/python long_mpc_example.py \
@@ -104,6 +106,7 @@ Most adaptations should only need these YAML groups:
 | `example.initial_joint_positions_rad` | `null`, a partial joint-name mapping, or a full joint-order sequence; choose a bent, nonsingular, collision-free pose |
 | `example.target_*` | reachable XYZ offsets and relative rot6D orientations, both based on that initial tool pose |
 | `timing` | optimization dt and control points; preserve enough real-time horizon for obstacle detours |
+| `optimizer.base_config` | complete cuRobo task/solver YAML; the provided app-owned example exposes L-BFGS history, line search, and CUDA-kernel settings |
 | `tool_pose_weight` | task accuracy priority for translation and rotation |
 | `scene_collision_weight`, `self_collision_weight` | raise until additional iterations do not trade penetration for pose error |
 | `cspace_bound_weight` | soft costs for position/velocity/acceleration/jerk/effort bounds |
@@ -120,6 +123,15 @@ start pose and IK, (2) choose horizon and target offsets, (3) make collision str
 relative to pose tracking, (4) tune motion regularization, and (5) measure the
 planner-time distribution before setting `planning_connection_delay_s`. Keep the
 5 ms application-side collision and physical-limit checks enabled throughout.
+
+The default optimizer example uses `history: 3`. Here `history` is the number of
+L-BFGS curvature pairs; it is unrelated to saved MPC trajectories. cuRobo's
+fused CUDA step-direction kernel requires approximately
+`(((2 * control_points * active_dof) + 2) * history + 33) * 4` bytes of shared
+memory. If that exceeds the device/kernel limit, runtime can rise sharply.
+Increase it only after measuring both solve quality and tail latency. Motion and
+collision weights remain in `long_mpc.yml`, where the application overrides the
+corresponding defaults in the complete optimizer YAML.
 
 `ContinuousMpcTrajectory.solve_horizon()` only returns a complete cuRobo
 `q/dq/ddq` rollout. For each Cartesian target, the adapter first solves IK from

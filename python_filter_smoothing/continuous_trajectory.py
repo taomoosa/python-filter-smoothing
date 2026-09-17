@@ -548,6 +548,60 @@ class ContinuousMpcTrajectory:
         self.prepare_candidate(current, self._candidate_iterations[0])
         return joint_reference
 
+    def set_tool_targets(
+        self,
+        target_poses: GoalToolPose,
+        *,
+        joint_reference: JointState | None = None,
+    ) -> None:
+        """Set one Cartesian target for every configured tool frame.
+
+        This is the coupled multi-arm entry point. The caller is responsible for
+        resolving IK (or providing a known joint-space realization) when
+        ``joint_reference`` is supplied. cuRobo still optimizes all joints
+        together and checks inter-arm self collision.
+        """
+
+        if self._goal_request is None:
+            raise RuntimeError("setup() must be called before set_tool_targets()")
+        if set(target_poses.tool_frames) != set(self.solver.tool_frames):
+            raise ValueError("target_poses must contain every configured tool frame")
+        target_poses = target_poses.reorder_links(self.solver.tool_frames)
+        if target_poses.shape != self._goal_request.shape:
+            raise ValueError(
+                "target_poses must contain one static target per configured tool frame"
+            )
+        if not bool(
+            torch.all(torch.isfinite(target_poses.position)).item()
+            and torch.all(torch.isfinite(target_poses.quaternion)).item()
+        ):
+            raise ValueError("target_poses must be finite")
+        if joint_reference is not None:
+            reference_position = joint_reference.position
+            if (
+                not isinstance(reference_position, torch.Tensor)
+                or reference_position.numel() != len(self.joint_names)
+                or not bool(torch.all(torch.isfinite(reference_position)).item())
+            ):
+                raise ValueError("joint_reference must contain one finite joint state")
+            if (
+                joint_reference.joint_names is not None
+                and list(joint_reference.joint_names) != self.joint_names
+            ):
+                raise ValueError("joint_reference must use the controller joint order")
+            joint_reference = JointState.from_position(
+                reference_position.reshape(1, -1).clone(),
+                joint_names=self.joint_names,
+            )
+
+        current = self._planner.current_state
+        self._goal_request.copy_(target_poses)
+        if not self.solver.update_goal_tool_poses(self._goal_request, run_ik=False):
+            raise RuntimeError("Cartesian goal update failed")
+        self._joint_reference_state = joint_reference
+        self._last_target_selection = None
+        self.prepare_candidate(current, self._candidate_iterations[0])
+
     def prepare_candidate(self, initial_state: JointState, iterations: int) -> None:
         """Reset one independent cold solve for the active target."""
 
